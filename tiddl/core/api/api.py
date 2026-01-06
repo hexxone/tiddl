@@ -253,3 +253,237 @@ class TidalAPI:
             },
             expire_after=DO_NOT_CACHE,
         )
+
+    def _request(self, method: str, endpoint: str, **kwargs) -> "requests.Response":
+        """Make a request with automatic token refresh on 401"""
+        import requests
+
+        url = f"https://api.tidal.com/v1/{endpoint}"
+        headers = kwargs.pop("headers", {})
+        headers["Authorization"] = f"Bearer {self.client.token}"
+
+        response = requests.request(method, url, headers=headers, **kwargs)
+
+        # Handle token expiry
+        if response.status_code == 401 and self.client.on_token_expiry:
+            new_token = self.client.on_token_expiry()
+            if new_token:
+                self.client.token = new_token
+                headers["Authorization"] = f"Bearer {self.client.token}"
+                response = requests.request(method, url, headers=headers, **kwargs)
+
+        return response
+
+    def get_user_playlists(self, limit: int = 50, offset: int = 0) -> dict:
+        """Get playlists created by the current user"""
+        response = self._request(
+            "GET",
+            f"users/{self.user_id}/playlists",
+            params={
+                "countryCode": self.country_code,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+        if response.status_code != 200:
+            from .exceptions import ApiError
+            try:
+                error_data = response.json()
+                raise ApiError(**error_data)
+            except Exception:
+                raise ApiError(
+                    status=response.status_code,
+                    subStatus="0",
+                    userMessage=f"Failed to get user playlists: {response.text}"
+                )
+
+        return response.json()
+
+    def create_playlist(self, title: str, description: str = "") -> dict:
+        """Create a new playlist"""
+        response = self._request(
+            "POST",
+            f"users/{self.user_id}/playlists",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "title": title,
+                "description": description,
+                "countryCode": self.country_code,
+            },
+        )
+
+        if response.status_code not in [200, 201]:
+            from .exceptions import ApiError
+            try:
+                error_data = response.json()
+                raise ApiError(**error_data)
+            except Exception:
+                raise ApiError(
+                    status=response.status_code,
+                    subStatus="0",
+                    userMessage=f"Failed to create playlist: {response.text}"
+                )
+
+        return response.json()
+
+    def add_tracks_to_playlist(self, playlist_uuid: str, track_ids: list[str], on_duplicate: str = "FAIL"):
+        """Add tracks to a playlist. If batch addition fails, tries adding tracks one by one."""
+        import logging
+        import time
+        from .exceptions import ApiError
+
+        logger = logging.getLogger(__name__)
+
+        def get_playlist_etag():
+            """Get the ETag from the playlist response headers"""
+            response = self._request(
+                "GET",
+                f"playlists/{playlist_uuid}",
+                params={"countryCode": self.country_code},
+            )
+            return response.headers.get('ETag') or response.headers.get('etag')
+
+        def add_tracks_request(track_ids_to_add: list[str], etag: str = None):
+            """Make the actual API request to add tracks"""
+            track_ids_str = ",".join(str(tid) for tid in track_ids_to_add)
+
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if etag:
+                headers["If-None-Match"] = etag
+
+            response = self._request(
+                "POST",
+                f"playlists/{playlist_uuid}/items",
+                headers=headers,
+                data={
+                    "trackIds": track_ids_str,
+                    "onDuplicates": on_duplicate,
+                    "countryCode": self.country_code,
+                },
+            )
+            return response
+
+        # Get initial ETag and try to add all tracks at once
+        etag = get_playlist_etag()
+        response = add_tracks_request(track_ids, etag)
+
+        if response.status_code in [200, 201]:
+            return response.json() if response.text else {}
+
+        # Log the failure details
+        error_detail = response.text[:500] if response.text else 'empty'
+        logger.warning(f"Batch addition failed: status={response.status_code}, response={error_detail}")
+
+        # Batch addition failed - try adding tracks one by one
+        failed_tracks = []
+        success_count = 0
+
+        for i, track_id in enumerate(track_ids):
+            # Refresh ETag for each track (playlist changes after each successful add)
+            etag = get_playlist_etag()
+            response = add_tracks_request([track_id], etag)
+
+            if response.status_code in [200, 201]:
+                success_count += 1
+            else:
+                logger.debug(f"Failed to add track {track_id}: status={response.status_code}")
+                failed_tracks.append(track_id)
+
+            # Small delay every 10 tracks to avoid rate limiting
+            if (i + 1) % 10 == 0:
+                time.sleep(0.5)
+
+        logger.info(f"One-by-one addition: {success_count} succeeded, {len(failed_tracks)} failed")
+
+        if failed_tracks:
+            raise ApiError(
+                status=404,
+                subStatus="2001",
+                userMessage=f"Failed to add {len(failed_tracks)} track(s). Track IDs: {', '.join(failed_tracks)}"
+            )
+
+        return {}
+
+    def delete_playlist_tracks(self, playlist_uuid: str, indices: list[int]):
+        """Delete tracks from playlist by their indices"""
+        # Get current ETag from response headers
+        response = self._request(
+            "GET",
+            f"playlists/{playlist_uuid}",
+            params={"countryCode": self.country_code},
+        )
+        etag = response.headers.get('ETag') or response.headers.get('etag')
+
+        # Join indices as comma-separated string
+        indices_str = ",".join(str(i) for i in indices)
+
+        headers = {}
+        if etag:
+            headers["If-None-Match"] = str(etag)
+
+        response = self._request(
+            "DELETE",
+            f"playlists/{playlist_uuid}/items/{indices_str}",
+            headers=headers,
+            params={"countryCode": self.country_code},
+        )
+
+        if response.status_code not in [200, 201, 204]:
+            from .exceptions import ApiError
+            try:
+                error_data = response.json()
+                raise ApiError(**error_data)
+            except Exception:
+                raise ApiError(
+                    status=response.status_code,
+                    subStatus="0",
+                    userMessage=f"Failed to delete tracks: {response.text}"
+                )
+
+        return {}
+
+    def update_playlist(self, playlist_uuid: str, title: str = None, description: str = None) -> dict:
+        """Update playlist title and/or description"""
+        # Get current ETag from response headers
+        response = self._request(
+            "GET",
+            f"playlists/{playlist_uuid}",
+            params={"countryCode": self.country_code},
+        )
+        etag = response.headers.get('ETag') or response.headers.get('etag')
+
+        # Build update data - only include fields that are provided
+        data = {}
+        if title is not None:
+            data["title"] = title
+        if description is not None:
+            data["description"] = description
+
+        if not data:
+            return {}  # Nothing to update
+
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if etag:
+            headers["If-None-Match"] = str(etag)
+
+        response = self._request(
+            "POST",
+            f"playlists/{playlist_uuid}",
+            headers=headers,
+            data=data,
+        )
+
+        if response.status_code not in [200, 201]:
+            from .exceptions import ApiError
+            try:
+                error_data = response.json()
+                raise ApiError(**error_data)
+            except Exception:
+                raise ApiError(
+                    status=response.status_code,
+                    subStatus="0",
+                    userMessage=f"Failed to update playlist: {response.text}"
+                )
+
+        return response.json() if response.text else {}

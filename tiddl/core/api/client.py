@@ -64,6 +64,81 @@ class TidalClient:
             }
         )
 
+    def post(
+        self,
+        endpoint: str,
+        data: dict[str, Any] = {},
+        params: dict[str, Any] = {},
+    ) -> dict[str, Any]:
+        """
+        POST data to the API endpoint and return the JSON response.
+        """
+        res = self.session.post(
+            f"{API_URL}/{endpoint}",
+            json=data,
+            params=params,
+        )
+
+        log.debug(f"POST {endpoint} {params} [{res.status_code}]")
+
+        if res.status_code == 401 and self.on_token_expiry:
+            token = self.on_token_expiry()
+            if token:
+                self.token = token
+                return self.post(endpoint=endpoint, data=data, params=params)
+
+        try:
+            response_data = res.json()
+        except JSONDecodeError:
+            if res.status_code in [200, 201]:
+                return {}
+            raise ApiError(
+                status=res.status_code,
+                subStatus="0",
+                userMessage="Response body does not contain valid json.",
+            )
+
+        if res.status_code not in [200, 201]:
+            log.error(f"{endpoint=}, {params=}, {response_data=}")
+            raise ApiError(**response_data)
+
+        return response_data
+
+    def delete(
+        self,
+        endpoint: str,
+        params: dict[str, Any] = {},
+    ) -> dict[str, Any]:
+        """
+        DELETE request to the API endpoint.
+        """
+        res = self.session.delete(
+            f"{API_URL}/{endpoint}",
+            params=params,
+        )
+
+        log.debug(f"DELETE {endpoint} {params} [{res.status_code}]")
+
+        if res.status_code == 401 and self.on_token_expiry:
+            token = self.on_token_expiry()
+            if token:
+                self.token = token
+                return self.delete(endpoint=endpoint, params=params)
+
+        if res.status_code not in [200, 201, 204]:
+            try:
+                response_data = res.json()
+                log.error(f"{endpoint=}, {params=}, {response_data=}")
+                raise ApiError(**response_data)
+            except JSONDecodeError:
+                raise ApiError(
+                    status=res.status_code,
+                    subStatus="0",
+                    userMessage=f"Delete failed with status {res.status_code}",
+                )
+
+        return {}
+
     def fetch(
         self,
         model: Type[T],

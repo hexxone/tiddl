@@ -57,16 +57,69 @@ $ tiddl
 ╭─ Commands ──────────────────────────────────────────────────────────────────────────────────────────────────╮
 │ auth       Manage Tidal authentication.                                                                     │
 │ download   Download Tidal resources.                                                                        │
+│ migrate    Migrate playlists from Spotify to Tidal.                                                         │
 ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
+## Features
+
+- 🎵 Download tracks, videos, albums, artists, playlists, and mixes from Tidal
+- 🎧 Support for maximum audio quality (up to 24-bit, 192 kHz FLAC)
+- 🔄 **NEW: Migrate playlists from Spotify to Tidal**
+- 📝 Automatic metadata tagging with lyrics support
+- 🎨 Cover art embedding and saving
+- 🔍 Smart file organization with custom templates
+- ⚡ Concurrent downloads with configurable thread count
+- 🚫 Skip existing files to avoid re-downloading
+- 📋 M3U playlist generation
+
 ## Authentication
+
+### Tidal Authentication
 
 Login to app with your Tidal account: run the command below and follow instructions.
 
 ```bash
 tiddl auth login
 ```
+
+### Spotify Authentication (for Migration)
+
+To migrate playlists from Spotify, you need to set up Spotify API credentials:
+
+1. Get Spotify API credentials from [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+   - Add `https://example.com/callback` to Redirect URIs
+2. Configure credentials:
+   ```bash
+   tiddl auth spotify-setup
+   ```
+3. Login to Spotify (opens browser, copy/paste URL):
+   ```bash
+   tiddl auth spotify-login
+   ```
+
+See [Spotify Migration Guide](docs/spotify_migration.md) for detailed instructions.
+
+## Migrating from Spotify
+
+Migrate your Spotify playlists to Tidal and automatically download them:
+
+```bash
+tiddl migrate spotify-to-tidal
+```
+
+This will:
+1. Fetch all your Spotify playlists
+2. Let you select which ones to migrate
+3. Convert tracks from Spotify to Tidal
+4. Create/update playlists in Tidal (Spotify is source of truth)
+5. Download the migrated playlists
+
+**Options:**
+- `--dry-run`: Preview without making changes
+- `--no-download`: Migrate without downloading
+
+See the [Spotify Migration Guide](docs/spotify_migration.md) for complete details.
 
 ## Downloading
 
