@@ -46,7 +46,7 @@ class PlaylistDownloader:
         self.on_complete = on_complete
         self._executor: Optional[ThreadPoolExecutor] = None
         self._futures: list[Future] = []
-        self._queued_playlists: list[tuple[str, str]] = []  # (uuid, name) for sequential mode
+        self._queued_playlists: list[tuple[str, str, int]] = []  # (uuid, name, track_count) for sequential mode
         self._playlist_names: dict[str, str] = {}  # uuid -> name mapping
         self._completed: int = 0
         self._failed: int = 0
@@ -56,7 +56,7 @@ class PlaylistDownloader:
         if enabled and parallel:
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def add_playlist(self, playlist_uuid: str, playlist_name: str = "Unknown"):
+    def add_playlist(self, playlist_uuid: str, playlist_name: str = "Unknown", track_count: int = 0):
         """Queue a playlist for download."""
         if not self.enabled:
             return
@@ -65,13 +65,13 @@ class PlaylistDownloader:
 
         if self.parallel and self._executor:
             # Start downloading immediately in background
-            future = self._executor.submit(self._download_playlist, playlist_uuid, playlist_name)
+            future = self._executor.submit(self._download_playlist, playlist_uuid, playlist_name, track_count)
             self._futures.append(future)
         else:
             # Queue for later
-            self._queued_playlists.append((playlist_uuid, playlist_name))
+            self._queued_playlists.append((playlist_uuid, playlist_name, track_count))
 
-    def _download_playlist(self, playlist_uuid: str, playlist_name: str) -> tuple[str, str, bool, str]:
+    def _download_playlist(self, playlist_uuid: str, playlist_name: str, track_count: int = 0) -> tuple[str, str, bool, str]:
         """Download a single playlist using tiddl CLI. Returns (uuid, name, success, message)."""
         try:
             log.debug(f"Starting download for playlist {playlist_name} ({playlist_uuid})")
@@ -79,10 +79,18 @@ class PlaylistDownloader:
             if self.skip_errors:
                 cmd.append("--skip-errors")
             log.debug(f"Running command: {cmd}")
+
+            # Dynamic timeout: 30 seconds per track, minimum 10 minutes, no maximum
+            # This accounts for large playlists (e.g., 2000 tracks = ~16 hours)
+            if track_count > 0:
+                timeout_seconds = max(600, track_count * 30)  # 30 sec/track, min 10 min
+            else:
+                timeout_seconds = 7200  # Default 2 hours if track count unknown
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=3600,  # 1 hour timeout per playlist
+                timeout=timeout_seconds,
             )
 
             stderr = result.stderr.decode(errors="replace")
@@ -112,7 +120,7 @@ class PlaylistDownloader:
         except subprocess.TimeoutExpired:
             with self._lock:
                 self._failed += 1
-                message = "Download timed out after 1 hour"
+                message = f"Download timed out (track_count={track_count})"
                 self._failed_playlists.append((playlist_uuid, playlist_name, message))
             log.warning(f"Playlist download timeout for {playlist_name}")
             if self.on_complete:
@@ -138,8 +146,8 @@ class PlaylistDownloader:
             return []
 
         results = []
-        for playlist_uuid, playlist_name in self._queued_playlists:
-            result = self._download_playlist(playlist_uuid, playlist_name)
+        for playlist_uuid, playlist_name, track_count in self._queued_playlists:
+            result = self._download_playlist(playlist_uuid, playlist_name, track_count)
             results.append(result)
         self._queued_playlists.clear()
         return results
@@ -152,7 +160,8 @@ class PlaylistDownloader:
         results = []
         for future in self._futures:
             try:
-                result = future.result(timeout=3700)  # Slightly more than the subprocess timeout
+                # No timeout here - let the subprocess timeout handle it
+                result = future.result(timeout=None)
                 results.append(result)
             except Exception as e:
                 log.error(f"Future error: {e}")

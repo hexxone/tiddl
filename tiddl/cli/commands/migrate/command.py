@@ -33,6 +33,7 @@ from .tracks import (
     search_tidal_track,
     add_single_track_to_playlist,
 )
+from .report import PlaylistReportCollector
 
 console = Console()
 log = getLogger(__name__)
@@ -230,6 +231,16 @@ def spotify_to_tidal(
     odesli_client = OdesliClient()
     migrated_playlist_ids = []
 
+    # Get download path from config for report scanning
+    from tiddl.cli.config import CONFIG
+    download_path = CONFIG.download.download_path
+
+    # Set up report collector for CSV generation
+    report_collector = PlaylistReportCollector(
+        log_dir=log_dir,
+        download_path=download_path,
+    )
+
     # Set up playlist downloader for downloading after migration
     playlist_downloader = PlaylistDownloader(
         enabled=DOWNLOAD,
@@ -255,6 +266,7 @@ def spotify_to_tidal(
             playlist=playlist,
             dry_run=DRY_RUN,
             log_dir=log_dir,
+            report_collector=report_collector,
         )
 
         if result:
@@ -276,14 +288,17 @@ def spotify_to_tidal(
                     console.print(f"  [yellow]Warning: Cleanup failed: {e}[/]\n")
 
             migrated_playlist_ids.append(result)
-            # Queue/start playlist download with name for better error reporting
-            playlist_downloader.add_playlist(result, playlist_name)
+            # Queue/start playlist download with name and track count for timeout calculation
+            track_count = playlist.get('tracks', {}).get('total', 0)
+            playlist_downloader.add_playlist(result, playlist_name, track_count)
 
     console.print("\n[bold green]Migration complete!")
 
     # Handle downloads
     if DOWNLOAD and migrated_playlist_ids:
-        console.print(f"\n[cyan]Downloading {len(migrated_playlist_ids)} migrated playlist(s)...[/]")
+        # Calculate total tracks across all playlists for better progress display
+        total_tracks = sum(p.get('tracks', {}).get('total', 0) for p in selected_playlists if p['name'] in playlist_names.values())
+        console.print(f"\n[cyan]Downloading {len(migrated_playlist_ids)} playlist(s) ({total_tracks} tracks total)...[/]")
         console.print("[dim]Using --skip-errors to skip unavailable tracks[/]")
 
         if PARALLEL_DOWNLOAD:
@@ -344,6 +359,14 @@ def spotify_to_tidal(
 
         playlist_downloader.shutdown()
 
+        # Mark playlists as downloaded in the report collector
+        for uuid, name, success, _ in results if PARALLEL_DOWNLOAD else []:
+            report_collector.mark_playlist_downloaded(name, success)
+
+    # Generate CSV reports for all playlists
+    if not DRY_RUN:
+        report_collector.finalize_and_write_reports(scan_downloads=DOWNLOAD)
+
 
 def migrate_playlist(
     ctx: Context,
@@ -352,6 +375,7 @@ def migrate_playlist(
     playlist: dict,
     dry_run: bool = False,
     log_dir: Optional[Path] = None,
+    report_collector: Optional[PlaylistReportCollector] = None,
 ) -> Optional[str]:
     """
     Migrate a single playlist from Spotify to Tidal.
@@ -415,6 +439,10 @@ def migrate_playlist(
             write_log_file(log_dir, playlist_name, log_lines)
         return None
 
+    # Start collecting track reports for this playlist
+    if report_collector:
+        report_collector.start_playlist(playlist_name, tidal_playlist_uuid)
+
     # Convert and add tracks to Tidal (immediately, one by one)
     # Calculate worst-case ETA based on Odesli rate limit (10 req/min = 6 sec/track)
     worst_case_minutes = (len(spotify_tracks) * 6) / 60
@@ -458,6 +486,14 @@ def migrate_playlist(
                 skipped_tracks.append(track_info)
                 skipped_by_metadata += 1
                 log_lines.append(f"SKIPPED (metadata match): {track_info}")
+                if report_collector:
+                    report_collector.add_track(
+                        playlist_name=playlist_name,
+                        spotify_track=spotify_track,
+                        tidal_id=matched_id,
+                        migration_status="skipped",
+                        migration_source="metadata_match",
+                    )
                 progress.update(task, advance=1)
                 continue
 
@@ -485,6 +521,14 @@ def migrate_playlist(
                 if tidal_id in existing_track_ids:
                     skipped_tracks.append(track_info)
                     log_lines.append(f"SKIPPED (already in playlist): {track_info}")
+                    if report_collector:
+                        report_collector.add_track(
+                            playlist_name=playlist_name,
+                            spotify_track=spotify_track,
+                            tidal_id=tidal_id,
+                            migration_status="skipped",
+                            migration_source=source or "existing",
+                        )
                 else:
                     # Try to add immediately
                     try:
@@ -493,6 +537,14 @@ def migrate_playlist(
                         added_tracks.append(tidal_id)
                         existing_track_ids.add(tidal_id)  # Mark as added
                         log_lines.append(f"ADDED ({source}): {track_info}")
+                        if report_collector:
+                            report_collector.add_track(
+                                playlist_name=playlist_name,
+                                spotify_track=spotify_track,
+                                tidal_id=tidal_id,
+                                migration_status="added",
+                                migration_source=source or "unknown",
+                            )
                     except Exception as add_error:
                         log.debug(f"Failed to add track {tidal_id}: {add_error}")
 
@@ -507,7 +559,17 @@ def migrate_playlist(
                                         added_tracks.append(fallback_id)
                                         existing_track_ids.add(fallback_id)
                                         fallback_found += 1
+                                        tidal_id = fallback_id  # Update for report
+                                        source = "tidal_search"
                                         log_lines.append(f"ADDED (tidal_search fallback): {track_info}")
+                                        if report_collector:
+                                            report_collector.add_track(
+                                                playlist_name=playlist_name,
+                                                spotify_track=spotify_track,
+                                                tidal_id=fallback_id,
+                                                migration_status="added",
+                                                migration_source="tidal_search_fallback",
+                                            )
                                     except Exception as e2:
                                         log.debug(f"Fallback add also failed: {e2}")
                             except Exception as e:
@@ -516,9 +578,25 @@ def migrate_playlist(
                         if not added:
                             failed_tracks.append(track_info)
                             log_lines.append(f"FAILED (could not add to playlist): {track_info}")
+                            if report_collector:
+                                report_collector.add_track(
+                                    playlist_name=playlist_name,
+                                    spotify_track=spotify_track,
+                                    tidal_id=tidal_id,
+                                    migration_status="failed_to_add",
+                                    migration_source=source or "unknown",
+                                )
             else:
                 failed_tracks.append(track_info)
                 log_lines.append(f"FAILED (not found on Tidal): {track_info}")
+                if report_collector:
+                    report_collector.add_track(
+                        playlist_name=playlist_name,
+                        spotify_track=spotify_track,
+                        tidal_id=None,
+                        migration_status="not_found",
+                        migration_source="",
+                    )
 
             progress.update(task, advance=1)
 
