@@ -1,21 +1,38 @@
 import typer
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, TimeElapsedColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+    TimeElapsedColumn,
+)
 from logging import getLogger
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
-import threading
-import queue
-import subprocess
-import sys
+
+from typing_extensions import Annotated
 
 from tiddl.cli.utils.spotify import load_spotify_credentials
 from tiddl.core.spotify import SpotifyClient, SpotifyAPI
 from tiddl.core.odesli import OdesliClient
 from tiddl.cli.ctx import Context
-from typing_extensions import Annotated
+
+from .downloader import PlaylistDownloader
+from .playlist import (
+    find_or_reuse_tidal_playlist,
+    write_log_file,
+    remove_duplicates_from_playlist,
+)
+from .tracks import (
+    match_spotify_to_existing_tidal,
+    search_tidal_track,
+    add_single_track_to_playlist,
+)
 
 console = Console()
 log = getLogger(__name__)
@@ -42,10 +59,24 @@ def spotify_to_tidal(
             help="Automatically download playlists after migration.",
         ),
     ] = True,
+    PARALLEL_DOWNLOAD: Annotated[
+        bool,
+        typer.Option(
+            "--parallel-download/--sequential-download",
+            help="Download playlists in parallel as they complete (default) or all at end.",
+        ),
+    ] = True,
+    CLEANUP: Annotated[
+        bool,
+        typer.Option(
+            "--cleanup/--no-cleanup",
+            help="Remove duplicate tracks from playlists after migration.",
+        ),
+    ] = True,
 ):
     """
     Migrate playlists from Spotify to Tidal and optionally download them.
-    
+
     This command will:
     1. Fetch all your Spotify playlists
     2. Let you select which ones to migrate
@@ -53,27 +84,27 @@ def spotify_to_tidal(
     4. Create/update playlists in Tidal
     5. Optionally download the migrated playlists
     """
-    
+
     # Load Spotify credentials and check authentication
     credentials = load_spotify_credentials()
-    
+
     if not credentials.client_id or not credentials.client_secret:
         console.print("[bold red]Spotify credentials not found!")
         console.print("Please run 'tiddl auth spotify-setup' first.")
         raise typer.Exit()
-    
+
     spotify_client = SpotifyClient(
         client_id=credentials.client_id,
         client_secret=credentials.client_secret,
     )
-    
+
     if not spotify_client.is_authenticated():
         console.print("[bold red]Not logged in to Spotify!")
         console.print("Please run 'tiddl auth spotify-login' first.")
         raise typer.Exit()
-    
+
     spotify_api = SpotifyAPI(spotify_client)
-    
+
     # Fetch user's playlists
     console.print("[cyan]Fetching your Spotify playlists...[/]")
 
@@ -178,16 +209,16 @@ def spotify_to_tidal(
         except ValueError:
             console.print("[bold red]Invalid selection format!")
             raise typer.Exit()
-    
+
     if not selected_playlists:
         console.print("[yellow]No playlists selected.")
         raise typer.Exit()
-    
+
     console.print(f"\n[green]Selected {len(selected_playlists)} playlist(s) for migration[/]\n")
-    
+
     if DRY_RUN:
         console.print("[yellow]DRY RUN - No changes will be made[/]\n")
-    
+
     # Create log directory for this run
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = Path(f"/tmp/tiddl/{timestamp}-runlog")
@@ -199,7 +230,24 @@ def spotify_to_tidal(
     odesli_client = OdesliClient()
     migrated_playlist_ids = []
 
+    # Set up playlist downloader for downloading after migration
+    playlist_downloader = PlaylistDownloader(
+        enabled=DOWNLOAD,
+        parallel=PARALLEL_DOWNLOAD,
+        max_workers=2,  # Download up to 2 playlists concurrently
+    )
+
+    if DOWNLOAD:
+        if PARALLEL_DOWNLOAD:
+            console.print("[dim]Playlists will be downloaded in parallel as they complete[/]\n")
+        else:
+            console.print("[dim]Playlists will be downloaded after all migrations complete[/]\n")
+
+    # Track playlist names for download reporting
+    playlist_names: dict[str, str] = {}
+
     for playlist in selected_playlists:
+        playlist_name = playlist['name']
         result = migrate_playlist(
             ctx=ctx,
             spotify_api=spotify_api,
@@ -207,13 +255,94 @@ def spotify_to_tidal(
             playlist=playlist,
             dry_run=DRY_RUN,
             log_dir=log_dir,
-            background_download=DOWNLOAD,  # Enable background downloads if download flag is set
         )
 
         if result:
+            playlist_names[result] = playlist_name
+
+            # Cleanup duplicates if enabled (before downloading)
+            if CLEANUP and not DRY_RUN:
+                console.print(f"  [dim]Cleaning up duplicates...[/]")
+                try:
+                    _, removed = remove_duplicates_from_playlist(
+                        ctx=ctx,
+                        playlist_uuid=result,
+                        dry_run=False,
+                    )
+                    if removed > 0:
+                        console.print(f"  [green]Cleaned up {removed} duplicate(s)[/]\n")
+                except Exception as e:
+                    log.warning(f"Failed to cleanup duplicates: {e}")
+                    console.print(f"  [yellow]Warning: Cleanup failed: {e}[/]\n")
+
             migrated_playlist_ids.append(result)
+            # Queue/start playlist download with name for better error reporting
+            playlist_downloader.add_playlist(result, playlist_name)
 
     console.print("\n[bold green]Migration complete!")
+
+    # Handle downloads
+    if DOWNLOAD and migrated_playlist_ids:
+        console.print(f"\n[cyan]Downloading {len(migrated_playlist_ids)} migrated playlist(s)...[/]")
+        console.print("[dim]Using --skip-errors to skip unavailable tracks[/]")
+
+        if PARALLEL_DOWNLOAD:
+            # Wait for parallel downloads to complete
+            completed, failed, pending = playlist_downloader.stats
+            if pending > 0 or completed > 0:
+                console.print(f"[dim]Waiting for {pending} pending download(s)...[/]")
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Downloading playlists...", total=len(migrated_playlist_ids))
+                results = playlist_downloader.wait_for_completion()
+                progress.update(task, completed=len(results))
+
+            completed, failed, _ = playlist_downloader.stats
+            if completed > 0:
+                console.print(f"[green]✓ Downloaded {completed} playlist(s)[/]")
+            if failed > 0:
+                console.print(f"[yellow]✗ Failed to download {failed} playlist(s)[/]")
+                # Show details of failed playlists
+                console.print("\n[bold yellow]Failed playlists:[/]")
+                for uuid, name, error in playlist_downloader.failed_playlists:
+                    console.print(f"  [red]✗[/] {name}")
+                    console.print(f"    [dim]{error}[/]")
+        else:
+            # Download sequentially at the end
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Downloading playlists...", total=len(migrated_playlist_ids))
+                for i, (uuid, name, success, message) in enumerate(playlist_downloader.download_queued()):
+                    progress.update(task, completed=i + 1)
+                    if success:
+                        console.print(f"  [green]✓ Downloaded: {name}[/]")
+                    else:
+                        console.print(f"  [yellow]✗ Failed: {name} - {message[:80]}[/]")
+
+            completed, failed, _ = playlist_downloader.stats
+            console.print(f"\n[green]Downloaded {completed} playlist(s), {failed} failed[/]")
+
+            # Show details of failed playlists
+            if failed > 0:
+                console.print("\n[bold yellow]Failed playlists:[/]")
+                for uuid, name, error in playlist_downloader.failed_playlists:
+                    console.print(f"  [red]✗[/] {name}")
+                    console.print(f"    [dim]{error}[/]")
+
+        playlist_downloader.shutdown()
 
 
 def migrate_playlist(
@@ -223,7 +352,6 @@ def migrate_playlist(
     playlist: dict,
     dry_run: bool = False,
     log_dir: Optional[Path] = None,
-    background_download: bool = False,
 ) -> Optional[str]:
     """
     Migrate a single playlist from Spotify to Tidal.
@@ -255,7 +383,7 @@ def migrate_playlist(
         console.print(f"  [bold red]Error fetching tracks: {e}[/]")
         log_lines.append(f"ERROR: Failed to fetch tracks: {e}")
         if log_dir:
-            _write_log_file(log_dir, playlist_name, log_lines)
+            write_log_file(log_dir, playlist_name, log_lines)
         return None
 
     console.print(f"  Found {len(spotify_tracks)} track(s)")
@@ -264,7 +392,7 @@ def migrate_playlist(
         console.print(f"  [yellow]Would migrate {len(spotify_tracks)} tracks[/]\n")
         log_lines.append(f"DRY RUN: Would migrate {len(spotify_tracks)} tracks")
         if log_dir:
-            _write_log_file(log_dir, playlist_name, log_lines)
+            write_log_file(log_dir, playlist_name, log_lines)
         return None
 
     # Create or find playlist in Tidal FIRST (before converting tracks)
@@ -284,7 +412,7 @@ def migrate_playlist(
         log.error(f"Failed to create/find Tidal playlist: {e}", exc_info=True)
         log_lines.append(f"ERROR: Failed to create/find Tidal playlist: {e}")
         if log_dir:
-            _write_log_file(log_dir, playlist_name, log_lines)
+            write_log_file(log_dir, playlist_name, log_lines)
         return None
 
     # Convert and add tracks to Tidal (immediately, one by one)
@@ -302,12 +430,6 @@ def migrate_playlist(
     fallback_found = 0  # Track how many were found via Tidal search
 
     api = ctx.obj.api
-
-    # Initialize background downloader if enabled
-    downloader = BackgroundDownloader(enabled=background_download)
-    if background_download:
-        downloader.start()
-        console.print(f"  [dim]Background downloads enabled[/]")
 
     with Progress(
         SpinnerColumn(),
@@ -370,7 +492,6 @@ def migrate_playlist(
                         added = True
                         added_tracks.append(tidal_id)
                         existing_track_ids.add(tidal_id)  # Mark as added
-                        downloader.add_track(tidal_id)  # Queue for background download
                         log_lines.append(f"ADDED ({source}): {track_info}")
                     except Exception as add_error:
                         log.debug(f"Failed to add track {tidal_id}: {add_error}")
@@ -385,7 +506,6 @@ def migrate_playlist(
                                         added = True
                                         added_tracks.append(fallback_id)
                                         existing_track_ids.add(fallback_id)
-                                        downloader.add_track(fallback_id)  # Queue for background download
                                         fallback_found += 1
                                         log_lines.append(f"ADDED (tidal_search fallback): {track_info}")
                                     except Exception as e2:
@@ -444,27 +564,13 @@ def migrate_playlist(
         log_lines.append("No new tracks needed to be added")
     elif not existing_track_ids and not added_tracks:
         console.print(f"  [bold red]Playlist is empty and no tracks could be added.[/]\n")
-        downloader.stop()
         if log_dir:
-            _write_log_file(log_dir, playlist_name, log_lines)
+            write_log_file(log_dir, playlist_name, log_lines)
         return None
     else:
         console.print(f"  [yellow]Playlist partially migrated[/]")
         console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
 
-    # Wait for background downloads to complete
-    if background_download and added_tracks:
-        downloaded, dl_failed, pending = downloader.stats
-        if pending > 0 or downloaded > 0:
-            console.print(f"  [dim]Waiting for {pending + (len(added_tracks) - downloaded - dl_failed)} background downloads...[/]")
-            downloader.wait_for_completion()
-            downloaded, dl_failed, _ = downloader.stats
-            if downloaded > 0:
-                console.print(f"  [green]Downloaded {downloaded} track(s)[/]")
-            if dl_failed > 0:
-                console.print(f"  [yellow]Failed to download {dl_failed} track(s)[/]")
-            log_lines.append(f"Downloads: {downloaded} succeeded, {dl_failed} failed")
-    downloader.stop()
     console.print()  # Add newline
 
     # Update playlist description with last sync timestamp
@@ -482,414 +588,156 @@ def migrate_playlist(
 
     # Write log file
     if log_dir:
-        _write_log_file(log_dir, playlist_name, log_lines)
+        write_log_file(log_dir, playlist_name, log_lines)
 
     return tidal_playlist_uuid
 
 
-def find_or_reuse_tidal_playlist(
+@migrate_command.command(help="Remove duplicate tracks from Tidal playlists.")
+def cleanup_duplicates(
     ctx: Context,
-    playlist_name: str,
-) -> tuple[str, set[str], list[dict]]:
+    DRY_RUN: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would be removed without actually doing it.",
+        ),
+    ] = False,
+    ALL_PLAYLISTS: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Clean up all playlists without prompting.",
+        ),
+    ] = False,
+):
     """
-    Find existing Tidal playlist by name or create a new one.
-    Returns tuple of (playlist_uuid, set of existing track IDs, list of existing track metadata).
-    Track metadata contains: id, title, artists (list of names), duration (seconds).
+    Remove duplicate tracks from your Tidal playlists.
+
+    This is useful to clean up playlists that have duplicate tracks
+    due to migration issues or other reasons.
     """
 
     api = ctx.obj.api
 
-    # Get user's own playlists (not favorites)
-    existing_playlist_uuid = None
-    existing_track_ids = set()
-    existing_tracks_metadata = []  # Store full track info for metadata matching
+    # Fetch user's playlists
+    console.print("[cyan]Fetching your Tidal playlists...[/]")
 
-    try:
-        offset = 0
-        limit = 50
-        while True:
+    playlists = []
+    offset = 0
+    limit = 50
+
+    while True:
+        try:
             user_playlists = api.get_user_playlists(limit=limit, offset=offset)
             items = user_playlists.get('items', [])
 
             if not items:
                 break
 
-            for playlist_data in items:
-                playlist_title = playlist_data.get('title', '')
-                if playlist_title == playlist_name:
-                    existing_playlist_uuid = playlist_data.get('uuid')
-                    num_tracks = playlist_data.get('numberOfTracks', 0)
-                    console.print(f"    Found existing playlist with {num_tracks} track(s)")
+            playlists.extend(items)
 
-                    # Fetch existing tracks with metadata
-                    if num_tracks > 0:
-                        track_offset = 0
-                        track_limit = 100
-                        while track_offset < num_tracks:
-                            items_resp = api.get_playlist_items(
-                                playlist_uuid=existing_playlist_uuid,
-                                limit=track_limit,
-                                offset=track_offset
-                            )
-                            if hasattr(items_resp, 'items') and items_resp.items:
-                                for item in items_resp.items:
-                                    if hasattr(item, 'item') and hasattr(item.item, 'id'):
-                                        track = item.item
-                                        track_id = str(track.id)
-                                        existing_track_ids.add(track_id)
-
-                                        # Store metadata for matching
-                                        artist_names = []
-                                        if hasattr(track, 'artists') and track.artists:
-                                            artist_names = [a.name for a in track.artists if hasattr(a, 'name')]
-                                        existing_tracks_metadata.append({
-                                            'id': track_id,
-                                            'title': getattr(track, 'title', ''),
-                                            'artists': artist_names,
-                                            'duration': getattr(track, 'duration', 0),
-                                        })
-                            track_offset += track_limit
-
-                    break
-
-            if existing_playlist_uuid:
-                break
-
-            # Check if there are more playlists to fetch
             total = user_playlists.get('totalNumberOfItems', 0)
             offset += limit
             if offset >= total:
                 break
 
-    except Exception as e:
-        log.warning(f"Error fetching user playlists: {e}")
-        # Fall through to create new playlist
+        except Exception as e:
+            console.print(f"[bold red]Error fetching playlists: {e}")
+            log.error(f"Failed to fetch playlists: {e}", exc_info=True)
+            raise typer.Exit()
 
-    if existing_playlist_uuid:
-        console.print(f"    Reusing existing playlist")
-        return existing_playlist_uuid, existing_track_ids, existing_tracks_metadata
+    if not playlists:
+        console.print("[yellow]No playlists found.")
+        raise typer.Exit()
 
-    # Create new playlist
-    console.print(f"    Creating new playlist...")
+    console.print(f"[green]Found {len(playlists)} playlist(s)[/]\n")
 
-    try:
-        result = api.create_playlist(
-            title=playlist_name,
-            description="Migrated from Spotify via tiddl"
+    # Display playlists in a table
+    table = Table(title="Your Tidal Playlists", show_header=True, header_style="bold magenta")
+    table.add_column("#", style="dim", width=6)
+    table.add_column("Name", style="cyan")
+    table.add_column("Tracks", justify="right", style="green")
+
+    for idx, playlist in enumerate(playlists, 1):
+        table.add_row(
+            str(idx),
+            playlist.get('title', 'Unknown'),
+            str(playlist.get('numberOfTracks', 0))
         )
 
-        # The response should contain the playlist UUID
-        if 'uuid' in result:
-            playlist_uuid = result['uuid']
-        elif 'data' in result and 'uuid' in result['data']:
-            playlist_uuid = result['data']['uuid']
-        else:
-            # Fallback: try to find the newly created playlist in user's playlists
-            user_playlists = api.get_user_playlists(limit=50, offset=0)
-            items = user_playlists.get('items', [])
-            # Find the playlist by name (most recently created with this name)
-            for pl in items:
-                if pl.get('title') == playlist_name:
-                    playlist_uuid = pl.get('uuid')
-                    break
-            else:
-                raise Exception("Could not determine created playlist UUID")
+    console.print(table)
+    console.print()
 
-        console.print(f"    Created new playlist")
-        return playlist_uuid, set(), []  # Empty set and list for new playlist
+    if DRY_RUN:
+        console.print("[yellow]DRY RUN - No changes will be made[/]\n")
 
-    except Exception as e:
-        log.error(f"Error creating playlist: {e}", exc_info=True)
-        raise Exception(f"Failed to create playlist: {e}")
-
-
-def _write_log_file(log_dir: Path, playlist_name: str, log_lines: list[str]):
-    """Write log lines to a file in the log directory"""
-    # Sanitize playlist name for filename
-    safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in playlist_name)
-    safe_name = safe_name.strip().replace(' ', '-')[:100]  # Limit length
-
-    log_file = log_dir / f"pl-{safe_name}.txt"
-
-    try:
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(log_lines))
-        log.debug(f"Wrote migration log to {log_file}")
-    except Exception as e:
-        log.error(f"Failed to write log file {log_file}: {e}")
-        console.print(f"[yellow]Warning: Could not write log file: {e}[/]")
-
-
-def add_tracks_to_tidal_playlist(
-    ctx: Context,
-    playlist_uuid: str,
-    track_ids: list[str],
-):
-    """Add tracks to a Tidal playlist in batches"""
-    from tiddl.core.api.exceptions import ApiError
-
-    api = ctx.obj.api
-
-    # Tidal API has a limit on how many tracks can be added at once
-    # Using 50 as a safe batch size (100 may fail for some accounts)
-    batch_size = 50
-    total_batches = (len(track_ids) + batch_size - 1) // batch_size
-
-    if total_batches > 1:
-        console.print(f"    Adding tracks in {total_batches} batches of up to {batch_size}...")
-
-    total_failed = 0
-    total_added = 0
-
-    for batch_num, i in enumerate(range(0, len(track_ids), batch_size), 1):
-        batch = track_ids[i:i + batch_size]
-        try:
-            api.add_tracks_to_playlist(
-                playlist_uuid=playlist_uuid,
-                track_ids=batch,
-                on_duplicate="SKIP"  # Skip duplicates instead of failing
-            )
-            total_added += len(batch)
-            if total_batches > 1:
-                console.print(f"    Batch {batch_num}/{total_batches} complete ({len(batch)} tracks)")
-        except ApiError as e:
-            # ApiError from one-by-one fallback contains count of failed tracks
-            # Some tracks may have succeeded even if the batch failed
-            error_msg = str(e.userMessage) if hasattr(e, 'userMessage') else str(e)
-            if "Failed to add" in error_msg and "track(s)" in error_msg:
-                # Extract the number of failed tracks from the error message
-                import re
-                match = re.search(r'Failed to add (\d+) track\(s\)', error_msg)
-                if match:
-                    batch_failed = int(match.group(1))
-                    batch_succeeded = len(batch) - batch_failed
-                    total_failed += batch_failed
-                    total_added += batch_succeeded
-                    console.print(f"    [yellow]Batch {batch_num}/{total_batches}: {batch_succeeded} added, {batch_failed} failed[/]")
-                else:
-                    total_failed += len(batch)
-                    console.print(f"    [yellow]Warning: Batch {batch_num} failed ({len(batch)} tracks)[/]")
-            else:
-                total_failed += len(batch)
-                console.print(f"    [yellow]Warning: Batch {batch_num} failed ({len(batch)} tracks)[/]")
-            log.error(f"Error adding batch {batch_num}: {e}")
-        except Exception as e:
-            log.error(f"Error adding batch {batch_num}: {e}", exc_info=True)
-            total_failed += len(batch)
-            console.print(f"    [yellow]Warning: Batch {batch_num} failed ({len(batch)} tracks)[/]")
-
-    if total_failed > 0:
-        console.print(f"    [yellow]Warning: {total_failed} track(s) could not be added[/]")
-        console.print(f"    Successfully added {total_added} track(s) to playlist")
+    # Playlist selection
+    if ALL_PLAYLISTS:
+        selected_playlists = playlists
+        console.print(f"[cyan]Processing all {len(playlists)} playlist(s)...[/]\n")
     else:
-        console.print(f"    Successfully added all {total_added} tracks to playlist")
+        console.print("[bold]Select playlists to clean up:[/]")
+        console.print("Enter playlist numbers separated by commas (e.g., 1,3,5)")
+        console.print("Or enter 'all' to clean up all playlists")
+        console.print("Or enter 'none' to cancel\n")
 
+        selection = typer.prompt("Your selection", default="all")
 
-def match_spotify_to_existing_tidal(spotify_track: dict, existing_tracks: list[dict]) -> Optional[str]:
-    """
-    Try to match a Spotify track to an existing Tidal track in the playlist by metadata.
-    Returns the Tidal track ID if a match is found, None otherwise.
-    """
-    if not existing_tracks:
-        return None
+        if selection.lower() == 'none':
+            console.print("[yellow]Cleanup cancelled.")
+            raise typer.Exit()
 
-    spotify_name = spotify_track.get('name', '')
-    spotify_artists = spotify_track.get('artists', [])
-    spotify_duration_ms = spotify_track.get('duration_ms', 0)
+        selected_playlists = []
 
-    for tidal_track in existing_tracks:
-        tidal_name = tidal_track.get('title', '')
-        tidal_artists = tidal_track.get('artists', [])
-        tidal_duration = tidal_track.get('duration', 0)
-
-        # Check duration match (within 2 seconds)
-        if not _duration_match(tidal_duration, spotify_duration_ms, tolerance_sec=2):
-            continue
-
-        # Check name match
-        if not _name_match(tidal_name, spotify_name):
-            continue
-
-        # Check artist match
-        # Convert tidal_artists (list of strings) to format expected by _artist_match
-        tidal_artists_dicts = [{'name': name} for name in tidal_artists]
-        if not _artist_match(tidal_artists_dicts, spotify_artists):
-            continue
-
-        # All criteria match
-        return tidal_track.get('id')
-
-    return None
-
-
-def add_single_track_to_playlist(api, playlist_uuid: str, track_id: str):
-    """Add a single track to a Tidal playlist"""
-    api.add_tracks_to_playlist(
-        playlist_uuid=playlist_uuid,
-        track_ids=[track_id],
-        on_duplicate="SKIP"
-    )
-
-
-class BackgroundDownloader:
-    """Background downloader that processes tracks while conversion continues"""
-
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
-        self.queue: queue.Queue = queue.Queue()
-        self.downloaded = 0
-        self.failed = 0
-        self.stop_signal = threading.Event()
-        self.worker_thread = None
-
-    def start(self):
-        """Start the background download worker"""
-        if not self.enabled:
-            return
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
-
-    def add_track(self, track_id: str):
-        """Queue a track for download"""
-        if self.enabled:
-            self.queue.put(track_id)
-
-    def stop(self):
-        """Signal the worker to stop after processing remaining items"""
-        self.stop_signal.set()
-        self.queue.put(None)  # Sentinel to wake up the worker
-        if self.worker_thread:
-            self.worker_thread.join(timeout=5)
-
-    def wait_for_completion(self):
-        """Wait for all queued downloads to complete"""
-        self.queue.join()
-
-    def _worker(self):
-        """Worker thread that downloads tracks from the queue"""
-        while not self.stop_signal.is_set():
+        if selection.lower() == 'all':
+            selected_playlists = playlists
+        else:
             try:
-                track_id = self.queue.get(timeout=1)
-                if track_id is None:
-                    self.queue.task_done()
-                    break
-
-                try:
-                    # Download the track using tiddl CLI
-                    result = subprocess.run(
-                        [sys.executable, "-m", "tiddl.cli.app", "download", "url", f"track/{track_id}"],
-                        capture_output=True,
-                        timeout=300,  # 5 min timeout per track
-                    )
-                    if result.returncode == 0:
-                        self.downloaded += 1
+                indices = [int(x.strip()) for x in selection.split(',')]
+                for idx in indices:
+                    if 1 <= idx <= len(playlists):
+                        selected_playlists.append(playlists[idx - 1])
                     else:
-                        self.failed += 1
-                        log.debug(f"Download failed for track {track_id}: {result.stderr.decode()[:200]}")
-                except subprocess.TimeoutExpired:
-                    self.failed += 1
-                    log.warning(f"Download timeout for track {track_id}")
-                except Exception as e:
-                    self.failed += 1
-                    log.debug(f"Download error for track {track_id}: {e}")
+                        console.print(f"[yellow]Warning: Invalid playlist number {idx}, skipping.")
+            except ValueError:
+                console.print("[bold red]Invalid selection format!")
+                raise typer.Exit()
 
-                self.queue.task_done()
+        if not selected_playlists:
+            console.print("[yellow]No playlists selected.")
+            raise typer.Exit()
 
-            except queue.Empty:
-                continue
+    console.print(f"[green]Selected {len(selected_playlists)} playlist(s) for cleanup[/]\n")
 
-    @property
-    def stats(self) -> tuple[int, int, int]:
-        """Return (downloaded, failed, pending) counts"""
-        return self.downloaded, self.failed, self.queue.qsize()
+    # Process each playlist
+    total_duplicates_removed = 0
 
+    for playlist in selected_playlists:
+        playlist_name = playlist.get('title', 'Unknown')
+        playlist_uuid = playlist.get('uuid')
 
-def _simplify_name(name: str) -> str:
-    """
-    Simplify a track/artist name for matching by removing version info.
-    Strips content after hyphens, parentheses, and brackets.
-    """
-    return name.split('-')[0].strip().split('(')[0].strip().split('[')[0].strip().lower()
+        if not playlist_uuid:
+            console.print(f"[yellow]Skipping playlist without UUID: {playlist_name}[/]")
+            continue
 
+        console.print(f"[bold cyan]Processing: {playlist_name}[/]")
 
-def _duration_match(tidal_duration: int, spotify_duration_ms: int, tolerance_sec: int = 2) -> bool:
-    """Check if durations match within tolerance (Spotify is in ms, Tidal in seconds)"""
-    spotify_duration_sec = spotify_duration_ms / 1000
-    return abs(tidal_duration - spotify_duration_sec) <= tolerance_sec
+        try:
+            total_tracks, duplicates_removed = remove_duplicates_from_playlist(
+                ctx=ctx,
+                playlist_uuid=playlist_uuid,
+                dry_run=DRY_RUN,
+            )
+            total_duplicates_removed += duplicates_removed
+        except Exception as e:
+            console.print(f"    [bold red]Error: {e}[/]")
+            log.error(f"Error cleaning playlist {playlist_name}: {e}", exc_info=True)
 
+        console.print()
 
-def _name_match(tidal_name: str, spotify_name: str) -> bool:
-    """Check if track names match (simplified comparison)"""
-    simple_tidal = _simplify_name(tidal_name)
-    simple_spotify = _simplify_name(spotify_name)
-
-    # Check if one contains the other
-    return simple_spotify in simple_tidal or simple_tidal in simple_spotify
-
-
-def _artist_match(tidal_artists: list, spotify_artists: list) -> bool:
-    """Check if at least one artist matches"""
-    # Simplify and split artist names (handle "Artist1 & Artist2" format)
-    def get_artist_names(artists):
-        names = set()
-        for artist in artists:
-            name = artist.get('name', '') if isinstance(artist, dict) else getattr(artist, 'name', str(artist))
-            # Split by common separators
-            for part in name.replace('&', ',').replace(' x ', ',').replace(' X ', ',').split(','):
-                names.add(_simplify_name(part.strip()))
-        return names
-
-    tidal_names = get_artist_names(tidal_artists)
-    spotify_names = get_artist_names(spotify_artists)
-
-    return bool(tidal_names & spotify_names)
-
-
-def search_tidal_track(ctx: Context, spotify_track: dict) -> Optional[str]:
-    """
-    Search for a track on Tidal using track name and artist.
-    Returns the Tidal track ID if found, None otherwise.
-    """
-    api = ctx.obj.api
-
-    track_name = spotify_track.get('name', '')
-    artists = spotify_track.get('artists', [])
-    duration_ms = spotify_track.get('duration_ms', 0)
-    isrc = spotify_track.get('external_ids', {}).get('isrc')
-
-    if not track_name or not artists:
-        return None
-
-    first_artist = artists[0].get('name', '') if artists else ''
-
-    # Build search query: simplified track name + first artist
-    query = f"{_simplify_name(track_name)} {_simplify_name(first_artist)}"
-
-    try:
-        search_result = api.get_search(query)
-
-        # Check tracks in search results
-        if hasattr(search_result, 'tracks') and hasattr(search_result.tracks, 'items'):
-            for tidal_track in search_result.tracks.items[:10]:  # Check top 10 results
-                # Try ISRC match first (most reliable)
-                if isrc and hasattr(tidal_track, 'isrc') and tidal_track.isrc == isrc:
-                    log.debug(f"Found ISRC match for '{track_name}': {tidal_track.id}")
-                    return str(tidal_track.id)
-
-                # Fall back to fuzzy matching
-                tidal_artists = tidal_track.artists if hasattr(tidal_track, 'artists') else []
-                tidal_duration = tidal_track.duration if hasattr(tidal_track, 'duration') else 0
-                tidal_name = tidal_track.title if hasattr(tidal_track, 'title') else ''
-
-                if (_duration_match(tidal_duration, duration_ms) and
-                    _name_match(tidal_name, track_name) and
-                    _artist_match(tidal_artists, artists)):
-                    log.debug(f"Found fuzzy match for '{track_name}': {tidal_track.id}")
-                    return str(tidal_track.id)
-
-        log.debug(f"No Tidal match found for '{track_name}'")
-        return None
-
-    except Exception as e:
-        log.error(f"Error searching Tidal for '{track_name}': {e}")
-        return None
+    # Summary
+    if DRY_RUN:
+        console.print(f"\n[bold yellow]DRY RUN SUMMARY: Would remove {total_duplicates_removed} duplicate(s) total[/]")
+    else:
+        console.print(f"\n[bold green]Cleanup complete! Removed {total_duplicates_removed} duplicate(s) total[/]")

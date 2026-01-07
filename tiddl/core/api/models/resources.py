@@ -48,12 +48,12 @@ class Track(BaseModel):
     copyright: Optional[str] = None
     bpm: Optional[int] = None
     url: str
-    isrc: str
+    isrc: Optional[str] = None  # Can be null for some tracks
     editable: bool
     explicit: bool
     audioQuality: TrackQuality
     audioModes: List[str]
-    mediaMetadata: MediaMetadata
+    mediaMetadata: Optional[MediaMetadata] = None  # Can be null for some tracks
     artist: Optional[Artist] = None
     artists: List[Artist]
     album: Album
@@ -71,7 +71,7 @@ class Video(BaseModel):
     class Album(BaseModel):
         id: int
         title: str
-        cover: str
+        cover: Optional[str] = None  # Can be null for some videos
         vibrantColor: Optional[str] = None
         videoCover: Optional[str] = None
 
@@ -81,21 +81,20 @@ class Video(BaseModel):
     trackNumber: int
     streamStartDate: Optional[datetime] = None
     imagePath: Optional[str] = None
-    imageId: str
+    imageId: Optional[str] = None  # Can be missing for some videos
     vibrantColor: Optional[str] = None
     duration: int
-    quality: Literal["MP4_1080P"] | str
+    quality: Optional[str] = None  # Can be missing for some videos
     streamReady: bool
     adSupportedStreamReady: bool
     djReady: bool
     stemReady: bool
-    streamStartDate: Optional[datetime] = None
     allowStreaming: bool
     explicit: bool
     popularity: int
-    type: str
+    type: Optional[str] = None  # Can be missing for some videos
     adsUrl: Optional[str] = None
-    adsPrePaywallOnly: bool
+    adsPrePaywallOnly: Optional[bool] = None  # Can be missing for some videos
     artist: Optional[Artist] = None
     artists: List[Artist]
     album: Optional[Album] = None
