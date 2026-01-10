@@ -34,6 +34,7 @@ from .tracks import (
     add_single_track_to_playlist,
 )
 from .report import PlaylistReportCollector
+from .ui import MigrationUI
 
 console = Console()
 log = getLogger(__name__)
@@ -41,6 +42,97 @@ log = getLogger(__name__)
 migrate_command = typer.Typer(
     name="migrate", help="Migrate playlists from Spotify to Tidal.", no_args_is_help=True
 )
+
+
+def _run_migration_loop(
+    ctx: Context,
+    spotify_api,
+    odesli_client,
+    selected_playlists: list,
+    playlist_downloader,
+    report_collector,
+    playlist_names: dict,
+    migrated_playlist_ids: list,
+    log_dir: Path,
+    dry_run: bool,
+    cleanup: bool,
+    download: bool,
+    parallel_download: bool,
+    ui: Optional[MigrationUI],
+):
+    """
+    Run the main migration loop over selected playlists.
+
+    This is extracted to work with both fancy UI and simple console modes.
+    """
+    total_playlists = len(selected_playlists)
+
+    for i, playlist in enumerate(selected_playlists, 1):
+        playlist_name = playlist['name']
+        track_count = playlist.get('tracks', {}).get('total', 0)
+
+        # Update UI with current playlist
+        if ui:
+            ui.start_playlist(i, total_playlists, playlist_name, track_count)
+        else:
+            console.print(f"[bold cyan]Processing playlist: {playlist_name}[/]")
+
+        result = migrate_playlist(
+            ctx=ctx,
+            spotify_api=spotify_api,
+            odesli_client=odesli_client,
+            playlist=playlist,
+            dry_run=dry_run,
+            log_dir=log_dir,
+            report_collector=report_collector,
+            ui=ui,
+        )
+
+        if result:
+            playlist_names[result] = playlist_name
+
+            # Cleanup duplicates if enabled (before downloading)
+            if cleanup and not dry_run:
+                if not ui:
+                    console.print(f"  [dim]Cleaning up duplicates...[/]")
+                try:
+                    _, removed = remove_duplicates_from_playlist(
+                        ctx=ctx,
+                        playlist_uuid=result,
+                        dry_run=False,
+                    )
+                    if removed > 0 and not ui:
+                        console.print(f"  [green]Cleaned up {removed} duplicate(s)[/]\n")
+                except Exception as e:
+                    log.warning(f"Failed to cleanup duplicates: {e}")
+                    if not ui:
+                        console.print(f"  [yellow]Warning: Cleanup failed: {e}[/]\n")
+
+            migrated_playlist_ids.append(result)
+
+            # Queue/start playlist download with name and track count for timeout calculation
+            if ui:
+                ui.queue_download(playlist_name)
+            playlist_downloader.add_playlist(result, playlist_name, track_count)
+
+            # Show download status in simple mode
+            if not ui and download and parallel_download:
+                completed, failed, pending = playlist_downloader.stats
+                total_queued = completed + failed + pending
+                if total_queued > 0:
+                    status_parts = []
+                    if completed > 0:
+                        status_parts.append(f"[green]{completed} ✓[/]")
+                    if failed > 0:
+                        status_parts.append(f"[red]{failed} ✗[/]")
+                    if pending > 0:
+                        status_parts.append(f"[dim]{pending} pending[/]")
+                    console.print(f"  [dim]Downloads: {' '.join(status_parts)}[/]")
+
+    # If using fancy UI with parallel downloads, wait for them to complete within the UI context
+    if ui and download and parallel_download:
+        # Keep UI running while downloads complete
+        playlist_downloader.wait_for_completion()
 
 
 @migrate_command.command(help="Migrate and download all Spotify playlists to Tidal.")
@@ -72,6 +164,13 @@ def spotify_to_tidal(
         typer.Option(
             "--cleanup/--no-cleanup",
             help="Remove duplicate tracks from playlists after migration.",
+        ),
+    ] = True,
+    FANCY_UI: Annotated[
+        bool,
+        typer.Option(
+            "--fancy-ui/--simple-ui",
+            help="Use split-screen UI showing migration and download progress side-by-side.",
         ),
     ] = True,
 ):
@@ -241,56 +340,64 @@ def spotify_to_tidal(
         download_path=download_path,
     )
 
+    # Create the migration UI (fancy or None for simple mode)
+    ui = MigrationUI(console=console) if FANCY_UI and not DRY_RUN else None
+
     # Set up playlist downloader for downloading after migration
     playlist_downloader = PlaylistDownloader(
         enabled=DOWNLOAD,
         parallel=PARALLEL_DOWNLOAD,
         max_workers=2,  # Download up to 2 playlists concurrently
+        on_complete=ui.get_download_callback() if ui else None,
     )
 
-    if DOWNLOAD:
-        if PARALLEL_DOWNLOAD:
-            console.print("[dim]Playlists will be downloaded in parallel as they complete[/]\n")
-        else:
-            console.print("[dim]Playlists will be downloaded after all migrations complete[/]\n")
+    if not FANCY_UI:
+        if DOWNLOAD:
+            if PARALLEL_DOWNLOAD:
+                console.print("[dim]Playlists will be downloaded in parallel as they complete[/]\n")
+            else:
+                console.print("[dim]Playlists will be downloaded after all migrations complete[/]\n")
 
     # Track playlist names for download reporting
     playlist_names: dict[str, str] = {}
+    total_playlists = len(selected_playlists)
 
-    for playlist in selected_playlists:
-        playlist_name = playlist['name']
-        result = migrate_playlist(
+    # Use the fancy UI context if enabled
+    if ui:
+        with ui:
+            _run_migration_loop(
+                ctx=ctx,
+                spotify_api=spotify_api,
+                odesli_client=odesli_client,
+                selected_playlists=selected_playlists,
+                playlist_downloader=playlist_downloader,
+                report_collector=report_collector,
+                playlist_names=playlist_names,
+                migrated_playlist_ids=migrated_playlist_ids,
+                log_dir=log_dir,
+                dry_run=DRY_RUN,
+                cleanup=CLEANUP,
+                download=DOWNLOAD,
+                parallel_download=PARALLEL_DOWNLOAD,
+                ui=ui,
+            )
+    else:
+        _run_migration_loop(
             ctx=ctx,
             spotify_api=spotify_api,
             odesli_client=odesli_client,
-            playlist=playlist,
-            dry_run=DRY_RUN,
-            log_dir=log_dir,
+            selected_playlists=selected_playlists,
+            playlist_downloader=playlist_downloader,
             report_collector=report_collector,
+            playlist_names=playlist_names,
+            migrated_playlist_ids=migrated_playlist_ids,
+            log_dir=log_dir,
+            dry_run=DRY_RUN,
+            cleanup=CLEANUP,
+            download=DOWNLOAD,
+            parallel_download=PARALLEL_DOWNLOAD,
+            ui=None,
         )
-
-        if result:
-            playlist_names[result] = playlist_name
-
-            # Cleanup duplicates if enabled (before downloading)
-            if CLEANUP and not DRY_RUN:
-                console.print(f"  [dim]Cleaning up duplicates...[/]")
-                try:
-                    _, removed = remove_duplicates_from_playlist(
-                        ctx=ctx,
-                        playlist_uuid=result,
-                        dry_run=False,
-                    )
-                    if removed > 0:
-                        console.print(f"  [green]Cleaned up {removed} duplicate(s)[/]\n")
-                except Exception as e:
-                    log.warning(f"Failed to cleanup duplicates: {e}")
-                    console.print(f"  [yellow]Warning: Cleanup failed: {e}[/]\n")
-
-            migrated_playlist_ids.append(result)
-            # Queue/start playlist download with name and track count for timeout calculation
-            track_count = playlist.get('tracks', {}).get('total', 0)
-            playlist_downloader.add_playlist(result, playlist_name, track_count)
 
     console.print("\n[bold green]Migration complete!")
 
@@ -376,6 +483,7 @@ def migrate_playlist(
     dry_run: bool = False,
     log_dir: Optional[Path] = None,
     report_collector: Optional[PlaylistReportCollector] = None,
+    ui: Optional[MigrationUI] = None,
 ) -> Optional[str]:
     """
     Migrate a single playlist from Spotify to Tidal.
@@ -386,7 +494,9 @@ def migrate_playlist(
     playlist_id = playlist['id']
     spotify_url = f"https://open.spotify.com/playlist/{playlist_id}"
 
-    console.print(f"[bold cyan]Processing playlist: {playlist_name}[/]")
+    # Only print if not using fancy UI (the loop already shows this)
+    if not ui:
+        console.print(f"[bold cyan]Processing playlist: {playlist_name}[/]")
 
     # Set up logging for this playlist
     log_lines = []
@@ -398,19 +508,22 @@ def migrate_playlist(
     log_lines.append("")
 
     # Fetch tracks from Spotify
-    console.print("  Fetching tracks from Spotify...")
+    if not ui:
+        console.print("  Fetching tracks from Spotify...")
 
     try:
         spotify_tracks = spotify_api.get_playlist_tracks(playlist_id)
         log_lines.append(f"Fetched {len(spotify_tracks)} tracks from Spotify")
     except Exception as e:
-        console.print(f"  [bold red]Error fetching tracks: {e}[/]")
+        if not ui:
+            console.print(f"  [bold red]Error fetching tracks: {e}[/]")
         log_lines.append(f"ERROR: Failed to fetch tracks: {e}")
         if log_dir:
             write_log_file(log_dir, playlist_name, log_lines)
         return None
 
-    console.print(f"  Found {len(spotify_tracks)} track(s)")
+    if not ui:
+        console.print(f"  Found {len(spotify_tracks)} track(s)")
 
     if dry_run:
         console.print(f"  [yellow]Would migrate {len(spotify_tracks)} tracks[/]\n")
@@ -420,7 +533,8 @@ def migrate_playlist(
         return None
 
     # Create or find playlist in Tidal FIRST (before converting tracks)
-    console.print("  Finding or creating playlist in Tidal...")
+    if not ui:
+        console.print("  Finding or creating playlist in Tidal...")
 
     try:
         tidal_playlist_uuid, existing_track_ids, existing_tracks_metadata = find_or_reuse_tidal_playlist(
@@ -430,9 +544,11 @@ def migrate_playlist(
         tidal_url = f"https://listen.tidal.com/playlist/{tidal_playlist_uuid}"
         log_lines.append(f"Target URL: {tidal_url}")
         log_lines.append(f"Found/created Tidal playlist with {len(existing_track_ids)} existing tracks")
-        console.print(f"  [green]✓ Playlist ready in Tidal ({len(existing_track_ids)} existing tracks)[/]")
+        if not ui:
+            console.print(f"  [green]✓ Playlist ready in Tidal ({len(existing_track_ids)} existing tracks)[/]")
     except Exception as e:
-        console.print(f"  [bold red]Error with Tidal playlist: {e}[/]")
+        if not ui:
+            console.print(f"  [bold red]Error with Tidal playlist: {e}[/]")
         log.error(f"Failed to create/find Tidal playlist: {e}", exc_info=True)
         log_lines.append(f"ERROR: Failed to create/find Tidal playlist: {e}")
         if log_dir:
@@ -444,9 +560,6 @@ def migrate_playlist(
         report_collector.start_playlist(playlist_name, tidal_playlist_uuid)
 
     # Convert and add tracks to Tidal (immediately, one by one)
-    # Calculate worst-case ETA based on Odesli rate limit (10 req/min = 6 sec/track)
-    worst_case_minutes = (len(spotify_tracks) * 6) / 60
-    console.print(f"  Converting & adding tracks... (max ~{worst_case_minutes:.0f} min due to rate limiting)")
     log_lines.append("")
     log_lines.append("Track Conversion Results:")
     log_lines.append("-" * 80)
@@ -459,7 +572,13 @@ def migrate_playlist(
 
     api = ctx.obj.api
 
-    with Progress(
+    # Use Progress bar only when not using fancy UI
+    if not ui:
+        worst_case_minutes = (len(spotify_tracks) * 6) / 60
+        console.print(f"  Converting & adding tracks... (max ~{worst_case_minutes:.0f} min due to rate limiting)")
+
+    # Create progress context - only active when not using fancy UI
+    progress_context = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -468,13 +587,20 @@ def migrate_playlist(
         TextColumn("ETA:"),
         TimeRemainingColumn(),
         console=console,
-    ) as progress:
-        task = progress.add_task("  Processing...", total=len(spotify_tracks))
+        disable=ui is not None,  # Disable progress bar when using fancy UI
+    )
 
-        for spotify_track in spotify_tracks:
+    with progress_context as progress:
+        task = progress.add_task("  Processing...", total=len(spotify_tracks)) if not ui else None
+
+        for track_idx, spotify_track in enumerate(spotify_tracks, 1):
             track_name = spotify_track['name']
             artists = ', '.join([artist['name'] for artist in spotify_track['artists']])
             track_info = f"{track_name} - {artists}"
+
+            # Update UI with current track
+            if ui:
+                ui.update_track(track_idx, track_info[:50])
 
             tidal_id = None
             source = None
@@ -486,6 +612,8 @@ def migrate_playlist(
                 skipped_tracks.append(track_info)
                 skipped_by_metadata += 1
                 log_lines.append(f"SKIPPED (metadata match): {track_info}")
+                if ui:
+                    ui.track_skipped(track_info[:40])
                 if report_collector:
                     report_collector.add_track(
                         playlist_name=playlist_name,
@@ -494,7 +622,8 @@ def migrate_playlist(
                         migration_status="skipped",
                         migration_source="metadata_match",
                     )
-                progress.update(task, advance=1)
+                if task is not None:
+                    progress.update(task, advance=1)
                 continue
 
             # Step 1: Try Odesli first
@@ -521,6 +650,8 @@ def migrate_playlist(
                 if tidal_id in existing_track_ids:
                     skipped_tracks.append(track_info)
                     log_lines.append(f"SKIPPED (already in playlist): {track_info}")
+                    if ui:
+                        ui.track_skipped(track_info[:40])
                     if report_collector:
                         report_collector.add_track(
                             playlist_name=playlist_name,
@@ -537,6 +668,8 @@ def migrate_playlist(
                         added_tracks.append(tidal_id)
                         existing_track_ids.add(tidal_id)  # Mark as added
                         log_lines.append(f"ADDED ({source}): {track_info}")
+                        if ui:
+                            ui.track_added(track_info[:40])
                         if report_collector:
                             report_collector.add_track(
                                 playlist_name=playlist_name,
@@ -562,6 +695,8 @@ def migrate_playlist(
                                         tidal_id = fallback_id  # Update for report
                                         source = "tidal_search"
                                         log_lines.append(f"ADDED (tidal_search fallback): {track_info}")
+                                        if ui:
+                                            ui.track_added(track_info[:40])
                                         if report_collector:
                                             report_collector.add_track(
                                                 playlist_name=playlist_name,
@@ -578,6 +713,8 @@ def migrate_playlist(
                         if not added:
                             failed_tracks.append(track_info)
                             log_lines.append(f"FAILED (could not add to playlist): {track_info}")
+                            if ui:
+                                ui.track_failed(track_info[:30], "add failed")
                             if report_collector:
                                 report_collector.add_track(
                                     playlist_name=playlist_name,
@@ -589,6 +726,8 @@ def migrate_playlist(
             else:
                 failed_tracks.append(track_info)
                 log_lines.append(f"FAILED (not found on Tidal): {track_info}")
+                if ui:
+                    ui.track_failed(track_info[:30], "not found")
                 if report_collector:
                     report_collector.add_track(
                         playlist_name=playlist_name,
@@ -598,23 +737,26 @@ def migrate_playlist(
                         migration_source="",
                     )
 
-            progress.update(task, advance=1)
+            if task is not None:
+                progress.update(task, advance=1)
 
-    console.print(f"  [green]Successfully added {len(added_tracks)}/{len(spotify_tracks)} tracks[/]")
-    if fallback_found > 0:
-        console.print(f"  [dim]({fallback_found} found via Tidal search fallback)[/]")
+    # Only print summary if not using fancy UI
+    if not ui:
+        console.print(f"  [green]Successfully added {len(added_tracks)}/{len(spotify_tracks)} tracks[/]")
+        if fallback_found > 0:
+            console.print(f"  [dim]({fallback_found} found via Tidal search fallback)[/]")
 
-    if skipped_tracks:
-        console.print(f"  [cyan]Skipped {len(skipped_tracks)} track(s) already in playlist[/]")
-        if skipped_by_metadata > 0:
-            console.print(f"  [dim]({skipped_by_metadata} matched by metadata - no conversion needed)[/]")
+        if skipped_tracks:
+            console.print(f"  [cyan]Skipped {len(skipped_tracks)} track(s) already in playlist[/]")
+            if skipped_by_metadata > 0:
+                console.print(f"  [dim]({skipped_by_metadata} matched by metadata - no conversion needed)[/]")
 
-    if failed_tracks:
-        console.print(f"  [yellow]Failed {len(failed_tracks)} track(s):[/]")
-        for track in failed_tracks[:5]:  # Show first 5
-            console.print(f"    - {track}")
-        if len(failed_tracks) > 5:
-            console.print(f"    ... and {len(failed_tracks) - 5} more")
+        if failed_tracks:
+            console.print(f"  [yellow]Failed {len(failed_tracks)} track(s):[/]")
+            for track in failed_tracks[:5]:  # Show first 5
+                console.print(f"    - {track}")
+            if len(failed_tracks) > 5:
+                console.print(f"    ... and {len(failed_tracks) - 5} more")
 
     # Add summary to log
     log_lines.append("")
@@ -633,23 +775,28 @@ def migrate_playlist(
     log_lines.append("")
 
     if added_tracks:
-        console.print(f"  [bold green]✓ Playlist migrated successfully![/]")
-        console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
+        if not ui:
+            console.print(f"  [bold green]✓ Playlist migrated successfully![/]")
+            console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
         log_lines.append(f"Successfully added {len(added_tracks)} tracks to Tidal playlist")
     elif skipped_tracks and not failed_tracks:
-        console.print(f"  [bold green]✓ Playlist already up to date![/]")
-        console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
+        if not ui:
+            console.print(f"  [bold green]✓ Playlist already up to date![/]")
+            console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
         log_lines.append("No new tracks needed to be added")
     elif not existing_track_ids and not added_tracks:
-        console.print(f"  [bold red]Playlist is empty and no tracks could be added.[/]\n")
+        if not ui:
+            console.print(f"  [bold red]Playlist is empty and no tracks could be added.[/]\n")
         if log_dir:
             write_log_file(log_dir, playlist_name, log_lines)
         return None
     else:
-        console.print(f"  [yellow]Playlist partially migrated[/]")
-        console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
+        if not ui:
+            console.print(f"  [yellow]Playlist partially migrated[/]")
+            console.print(f"  [dim]Tidal Playlist UUID: {tidal_playlist_uuid}[/]")
 
-    console.print()  # Add newline
+    if not ui:
+        console.print()  # Add newline
 
     # Update playlist description with last sync timestamp
     try:

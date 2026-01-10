@@ -75,9 +75,12 @@ class PlaylistDownloader:
         """Download a single playlist using tiddl CLI. Returns (uuid, name, success, message)."""
         try:
             log.debug(f"Starting download for playlist {playlist_name} ({playlist_uuid})")
-            cmd = _get_tiddl_command() + ["download", "url", f"playlist/{playlist_uuid}"]
+            # Build command: tiddl download [options] url <playlist>
+            # Options like --skip-errors must come BEFORE the 'url' subcommand
+            cmd = _get_tiddl_command() + ["download"]
             if self.skip_errors:
                 cmd.append("--skip-errors")
+            cmd.extend(["url", f"playlist/{playlist_uuid}"])
             log.debug(f"Running command: {cmd}")
 
             # Dynamic timeout: 30 seconds per track, minimum 10 minutes, no maximum
@@ -93,6 +96,7 @@ class PlaylistDownloader:
                 timeout=timeout_seconds,
             )
 
+            stdout = result.stdout.decode(errors="replace")
             stderr = result.stderr.decode(errors="replace")
 
             with self._lock:
@@ -102,12 +106,17 @@ class PlaylistDownloader:
                     success = True
                 else:
                     self._failed += 1
-                    # Extract a cleaner error message
-                    error_lines = [l.strip() for l in stderr.split('\n') if l.strip() and 'error' in l.lower()]
+                    # Extract a cleaner error message from both stdout and stderr
+                    all_output = f"{stdout}\n{stderr}"
+                    error_lines = [l.strip() for l in all_output.split('\n') if l.strip() and 'error' in l.lower()]
                     if error_lines:
                         message = error_lines[0][:200]
+                    elif stderr.strip():
+                        message = stderr.strip()[:200]
+                    elif stdout.strip():
+                        message = stdout.strip()[:200]
                     else:
-                        message = stderr[:200] if stderr else "Unknown error"
+                        message = f"Exit code {result.returncode}"
                     success = False
                     self._failed_playlists.append((playlist_uuid, playlist_name, message))
                     log.warning(f"Playlist download failed for {playlist_name}: {message}")
