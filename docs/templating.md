@@ -51,28 +51,45 @@ Each object type exposes fields you can use inside templates.
 
 ### `album`
 
-| Field                | Description                         | Example           | Type     |
-| -------------------- | ----------------------------------- | ----------------- | -------- |
-| `album.id`           | Album ID                            | `98765`           | int      |
-| `album.title`        | Album title                         | `Discovery`       | str      |
-| `album.artist`       | Primary artist                      | `Daft Punk`       | str      |
-| `album.artists`      | All main artists                    | `Daft Punk`       | str      |
-| `album.date`         | Release date                        | `2001-03-13`      | datetime |
-| `album.explicit`     | Explicit content                    | `clean`           | str      |
-| `album.master:[MAX]` | Is album max quality (`UserFormat`) | `[MAX]`           | str      |
-| `album.release`      | Release type                        | `ALBUM/EP/SINGLE` | str      |
+| Field                | Description                         | Example            | Type     |
+| -------------------- | ----------------------------------- | ------------------ | -------- |
+| `album.id`           | Album ID                            | `98765`            | int      |
+| `album.title`        | Album title                         | `Discovery`        | str      |
+| `album.artist`       | Primary artist                      | `Daft Punk`        | str      |
+| `album.artists`      | All main artists                    | `Daft Punk`        | str      |
+| `album.date`         | Release date                        | `2001-03-13`       | datetime |
+| `album.explicit`     | Explicit content                    | `clean`            | str      |
+| `album.master:[MAX]` | Is album max quality (`UserFormat`) | `[MAX]`            | str      |
+| `album.release`      | Release type                        | `ALBUM/EP/SINGLE`  | str      |
+| `album.upc`          | UPC barcode                         | `044006539829`     | str      |
+| `album.copyright`    | Copyright info                      | `© 2001 Virgin`    | str      |
+| `album.version`      | Album version                       | `Deluxe Edition`   | str      |
+| `album.tracks`       | Number of tracks                    | `14`               | int      |
+| `album.volumes`      | Number of discs/volumes             | `1`                | int      |
 
 ---
 
 ### `playlist`
 
-| Field              | Description                    | Example               | Type     |
-| ------------------ | ------------------------------ | --------------------- | -------- |
-| `playlist.uuid`    | Playlist unique ID             | `b8f1d9f8-...`        | str      |
-| `playlist.title`   | Playlist name                  | `My Favorites`        | str      |
-| `playlist.index`   | Track index within playlist    | `5`                   | int      |
-| `playlist.created` | Creation date (`datetime`)     | `2024-01-15 10:42:00` | datetime |
-| `playlist.updated` | Last updated date (`datetime`) | `2024-03-02 09:00:00` | datetime |
+| Field                   | Description                         | Example               | Type     |
+| ----------------------- | ----------------------------------- | --------------------- | -------- |
+| `playlist.uuid`         | Playlist unique ID                  | `b8f1d9f8-...`        | str      |
+| `playlist.title`        | Playlist name                       | `My Favorites`        | str      |
+| `playlist.index`        | Track index within playlist         | `5`                   | int      |
+| `playlist.created`      | Creation date (`datetime`)          | `2024-01-15 10:42:00` | datetime |
+| `playlist.updated`      | Last updated date (`datetime`)      | `2024-03-02 09:00:00` | datetime |
+| `playlist.creator`      | Creator's user ID                   | `123456789`           | int      |
+| `playlist.creator_name` | Creator's display name              | `John Doe`            | str      |
+| `playlist.description`  | Playlist description                | `My top tracks`       | str      |
+| `playlist.duration`     | Total duration in seconds           | `3600`                | int      |
+| `playlist.tracks`       | Number of tracks                    | `25`                  | int      |
+| `playlist.videos`       | Number of videos                    | `0`                   | int      |
+| `playlist.type`         | Playlist type                       | `USER`                | str      |
+| `playlist.public:P`     | Is public playlist (`UserFormat`)   | `P`                   | str      |
+
+> [!TIP]
+> The `playlist.creator_name` is fetched automatically via an additional API call when you use it in your template.
+> Results are cached for 24 hours to minimize API requests.
 
 > [!NOTE]
 > Tidal API does not provide full album data for playlist tracks,
@@ -102,6 +119,8 @@ You can format `UserFormat` fields how you want:
 | `item.dolby:DOLBY`           | DOLBY         |             |
 | `item.dolby:dolby`           | dolby         |             |
 | `album.master:(Max Quality)` | [Max Quality] |             |
+| `playlist.public:public`     | public        |             |
+| `playlist.public:P`          | P             |             |
 
 ### `extra` and `custom` fields
 
@@ -132,7 +151,7 @@ default = "{album.artist}/{album.title}/{item.title}"
 track = "tracks/{item.id}"
 video = "videos/{item.title}"
 album = "artists/{album.artist}/{album.title}/{item.title}"
-playlist = "{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
+playlist = "{playlist.creator_name}/{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
 mix = "mixes/{mix_id}/{item.artist} - {item.title}"
 ```
 

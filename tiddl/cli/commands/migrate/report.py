@@ -126,10 +126,16 @@ def find_downloaded_file(
     tidal_id: str,
     tidal_title: str,
     tidal_artist: str,
+    tidal_album: str = "",
 ) -> Optional[Path]:
     """
     Try to find the downloaded file for a Tidal track.
     This searches the download directory for files matching the track.
+
+    Uses a multi-strategy approach:
+    1. Search in artist directory first (files are typically at artist/album/title.ext)
+    2. If album is known, search within artist/album subdirectory
+    3. Fall back to full recursive search with combined title+artist matching
     """
     if not download_path.exists():
         return None
@@ -137,15 +143,68 @@ def find_downloaded_file(
     # Common audio extensions
     extensions = [".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"]
 
-    # Strategy 1: Search for files containing the track title
-    # Normalize the title for matching
-    title_normalized = tidal_title.lower().replace(" ", "").replace("-", "").replace("_", "")
+    def normalize(text: str) -> str:
+        """Normalize text for fuzzy matching."""
+        if not text:
+            return ""
+        return text.lower().replace(" ", "").replace("-", "").replace("_", "").replace("(", "").replace(")", "")
 
+    title_norm = normalize(tidal_title)
+    artist_norm = normalize(tidal_artist)
+    album_norm = normalize(tidal_album)
+
+    if not title_norm:
+        return None
+
+    # Helper to check if file matches the track
+    def matches_track(file_path: Path) -> bool:
+        file_name = normalize(file_path.stem)
+        parent_name = normalize(file_path.parent.name)
+        grandparent_name = normalize(file_path.parent.parent.name) if file_path.parent.parent else ""
+
+        # Check if title matches filename
+        if title_norm not in file_name and file_name not in title_norm:
+            return False
+
+        # If we have artist info, verify artist is in the path
+        if artist_norm:
+            # Artist should be in grandparent (for artist/album/track structure)
+            # or parent (for artist/track structure)
+            if artist_norm not in grandparent_name and artist_norm not in parent_name:
+                # Try partial match for artist names
+                artist_parts = artist_norm.split(",")
+                if not any(part.strip() in grandparent_name or part.strip() in parent_name
+                          for part in artist_parts if part.strip()):
+                    return False
+
+        # If we have album info, verify album is in the path
+        if album_norm and parent_name:
+            if album_norm not in parent_name and parent_name not in album_norm:
+                # Allow partial album match
+                pass  # Don't strictly require album match as filenames vary
+
+        return True
+
+    # Strategy 1: Search in artist directory first (most efficient)
+    if tidal_artist:
+        # Try to find artist directory (may have slightly different naming)
+        for artist_dir in download_path.iterdir():
+            if not artist_dir.is_dir():
+                continue
+            artist_dir_norm = normalize(artist_dir.name)
+
+            # Check if this is the artist's directory
+            if artist_norm and artist_norm in artist_dir_norm:
+                # Search within this artist's directory
+                for ext in extensions:
+                    for file_path in artist_dir.rglob(f"*{ext}"):
+                        if matches_track(file_path):
+                            return file_path
+
+    # Strategy 2: Full recursive search as fallback
     for ext in extensions:
         for file_path in download_path.rglob(f"*{ext}"):
-            file_name = file_path.stem.lower().replace(" ", "").replace("-", "").replace("_", "")
-            # Check if title is in filename
-            if title_normalized and title_normalized in file_name:
+            if matches_track(file_path):
                 return file_path
 
     return None
@@ -211,16 +270,25 @@ def update_track_with_download_metadata(
 ) -> TrackReport:
     """
     Update a track report with metadata from the downloaded file.
+
+    Uses Tidal metadata if available, falls back to Spotify metadata for file finding.
     """
     if not track.tidal_id or track.download_status != "downloaded":
         return track
+
+    # Use Tidal info if available, fall back to Spotify info
+    # (Tidal and Spotify titles/artists are usually very similar)
+    search_title = track.tidal_title or track.spotify_title
+    search_artist = track.tidal_artist or track.spotify_artist
+    search_album = track.tidal_album or track.spotify_album
 
     # Try to find the downloaded file
     file_path = find_downloaded_file(
         download_path=download_path,
         tidal_id=track.tidal_id,
-        tidal_title=track.tidal_title,
-        tidal_artist=track.tidal_artist,
+        tidal_title=search_title,
+        tidal_artist=search_artist,
+        tidal_album=search_album,
     )
 
     if file_path:

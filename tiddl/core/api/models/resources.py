@@ -195,3 +195,26 @@ class Artist(BaseModel):
     popularity: Optional[int] = None
     artistRoles: Optional[List[Role]] = None
     mixes: Optional[Mix | Dict[Any, Any]] = None
+
+
+class UserProfile(BaseModel):
+    """User profile information from Tidal API"""
+    id: int
+    firstName: Optional[str] = None
+    lastName: Optional[str] = None
+    nickname: Optional[str] = None
+    username: Optional[str] = None
+    picture: Optional[str] = None
+
+    @property
+    def display_name(self) -> str:
+        """Get the best available display name for the user"""
+        if self.nickname:
+            return self.nickname
+        if self.firstName and self.lastName:
+            return f"{self.firstName} {self.lastName}"
+        if self.firstName:
+            return self.firstName
+        if self.username:
+            return self.username
+        return str(self.id)

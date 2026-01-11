@@ -95,20 +95,75 @@ tiddl migrate spotify-to-tidal --no-download
 
 ## Playlist Selection
 
-When prompted, you can select playlists in several ways:
+tiddl uses an **interactive toggle selection** by default. You can select and deselect playlists before confirming.
 
-- **All playlists**: Type `all`
-- **Specific playlists**: Type comma-separated numbers (e.g., `1,3,5`)
-- **Cancel**: Type `none`
+### Interactive Mode (Default)
 
-Example:
+When you run `tiddl migrate spotify-to-tidal`, you'll see a table with checkboxes:
+
 ```
-Select playlists to migrate:
-Enter playlist numbers separated by commas (e.g., 1,3,5)
-Or enter 'all' to migrate all playlists
-Or enter 'none' to cancel
+┌───────────────────────────────────────────────────────┐
+│              Your Spotify Playlists                   │
+├───┬────┬──────────────────────┬────────┬──────────────┤
+│   │ #  │ Name                 │ Tracks │ Owner        │
+├───┼────┼──────────────────────┼────────┼──────────────┤
+│ ✓ │ 1  │ My Favorites         │    125 │ ★ You        │
+│ ✓ │ 2  │ Workout Mix          │     45 │ ★ You        │
+│ ○ │ 3  │ Chill Vibes          │    200 │ Alice        │
+│ ○ │ 4  │ Rock Classics        │    150 │ Bob          │
+└───┴────┴──────────────────────┴────────┴──────────────┘
 
-Your selection: 1,2,5
+Selected: 2 playlist(s), 170 total tracks
+
+Selection>
+```
+
+### Selection Commands
+
+| Command | Description |
+|---------|-------------|
+| `1,2,3` | Toggle specific playlists by number |
+| `1-5` | Toggle a range of playlists |
+| `@owner` | Toggle all playlists by owner (partial match works) |
+| `all` | Select all playlists |
+| `none` | Deselect all playlists |
+| `mine` | Select only your own playlists |
+| `invert` | Invert current selection |
+| `help` | Show command help |
+| `done` or Enter | Confirm selection and proceed |
+
+### Examples
+
+```
+Selection> 3          # Toggle playlist #3
+Selection> 1-5        # Toggle playlists 1 through 5
+Selection> @alice     # Toggle all playlists owned by "Alice"
+Selection> invert     # Flip all selections
+Selection>            # Press Enter to confirm and start migration
+```
+
+### Non-Interactive Mode
+
+For scripting or automation, use the `--select` option:
+
+```bash
+# Select all playlists
+tiddl migrate spotify-to-tidal --select all
+
+# Select only your own playlists
+tiddl migrate spotify-to-tidal --select mine
+
+# Select specific playlists
+tiddl migrate spotify-to-tidal --select "1,3,5"
+
+# Select a range
+tiddl migrate spotify-to-tidal --select "1-10"
+```
+
+You can also disable interactive mode entirely:
+
+```bash
+tiddl migrate spotify-to-tidal --no-interactive
 ```
 
 ## How It Works

@@ -75,6 +75,11 @@ class AlbumTemplate:
     explicit: Explicit
     master: UserFormat
     release: str
+    upc: str
+    copyright: str
+    version: str
+    tracks: int
+    volumes: int
 
 
 @dataclass(slots=True)
@@ -104,6 +109,14 @@ class PlaylistTemplate:
     index: int
     created: datetime
     updated: datetime
+    creator: int
+    creator_name: str
+    description: str
+    duration: int
+    tracks: int
+    videos: int
+    type: str
+    public: UserFormat
 
 
 def generate_template_data(
@@ -112,6 +125,7 @@ def generate_template_data(
     playlist: Playlist | None = None,
     playlist_index: int = 0,
     quality: str = "",
+    creator_name: str = "",
 ) -> dict[str, ItemTemplate | AlbumTemplate | PlaylistTemplate | None]:
     """Normalize Tidal API Track/Video + Album data into safe templates."""
 
@@ -171,16 +185,36 @@ def generate_template_data(
                 "HIRES_LOSSLESS" in album.mediaMetadata.tags and quality == "MAX"
             ),
             release=album.type,
+            upc=album.upc,
+            copyright=album.copyright or "",
+            version=album.version or "",
+            tracks=album.numberOfTracks,
+            volumes=album.numberOfVolumes,
         )
 
     playlist_template = None
     if playlist:
+        # Extract creator ID - creator can be Creator object or dict
+        creator_id = 0
+        if hasattr(playlist.creator, "id"):
+            creator_id = playlist.creator.id
+        elif isinstance(playlist.creator, dict) and "id" in playlist.creator:
+            creator_id = playlist.creator["id"]
+
         playlist_template = PlaylistTemplate(
             uuid=playlist.uuid,
             title=playlist.title,
             index=playlist_index,
             created=datetime.fromisoformat(playlist.created),
             updated=datetime.fromisoformat(playlist.lastUpdated),
+            creator=creator_id,
+            creator_name=creator_name or str(creator_id),
+            description=playlist.description or "",
+            duration=playlist.duration,
+            tracks=playlist.numberOfTracks,
+            videos=playlist.numberOfVideos,
+            type=playlist.type,
+            public=UserFormat(playlist.publicPlaylist),
         )
 
     templates: dict[str, ItemTemplate | AlbumTemplate | PlaylistTemplate | None] = {
@@ -199,6 +233,7 @@ def format_template(
     playlist: Playlist | None = None,
     playlist_index: int = 0,
     quality: str = "",
+    creator_name: str = "",
     with_asterisk_ext: bool = True,
     **extra,
 ) -> str:
@@ -215,6 +250,7 @@ def format_template(
             playlist=playlist,
             playlist_index=playlist_index,
             quality=quality,
+            creator_name=creator_name,
         )
         | extra
         | custom_fields

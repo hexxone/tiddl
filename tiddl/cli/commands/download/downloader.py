@@ -18,7 +18,7 @@ from tiddl.core.utils.const import (
     track_qualities,
     video_qualities,
 )
-from tiddl.core.utils.ffmpeg import convert_to_mp4, extract_flac
+from tiddl.core.utils.ffmpeg import convert_to_mp4, extract_flac, verify_audio_file
 
 from .output import RichOutput
 
@@ -48,6 +48,7 @@ class Downloader:
     video_quality: StreamVideoQuality
     videos_filter: VIDEOS_FILTER_LITERAL
     skip_existing: bool
+    verify_existing: bool
     download_path: Path
     scan_path: Path
 
@@ -62,6 +63,7 @@ class Downloader:
         skip_existing: bool,
         download_path: Path,
         scan_path: Path,
+        verify_existing: bool = True,
     ) -> None:
         self.api = tidal_api
         self.rich_output = rich_output
@@ -70,6 +72,7 @@ class Downloader:
         self.video_quality = video_qualities[video_quality]
         self.videos_filter = videos_filter
         self.skip_existing = skip_existing
+        self.verify_existing = verify_existing
         self.download_path = download_path
         self.scan_path = scan_path
 
@@ -110,12 +113,47 @@ class Downloader:
             result_message = "[cyan]Overwrited"
 
             if self.skip_existing:
-                self.rich_output.show_item_result(
-                    result_message="[yellow]Exists",
-                    item_description=f"[{vibrant_color}]{item.title}",
-                    item_path=existing_file_path,
-                )
-                return existing_file_path, False
+                # Verify file integrity before skipping
+                should_skip = True
+
+                if self.verify_existing:
+                    # Get expected duration from track metadata (Tidal duration is in seconds)
+                    expected_duration = None
+                    if isinstance(item, Track):
+                        expected_duration = float(item.duration) if item.duration else None
+
+                    is_valid, error_msg = verify_audio_file(
+                        existing_file_path,
+                        expected_duration_sec=expected_duration,
+                    )
+
+                    if not is_valid:
+                        log.warning(
+                            f"Existing file failed verification: {existing_file_path} - {error_msg}"
+                        )
+                        self.rich_output.console.print(
+                            f"[yellow]Corrupt[/] [{vibrant_color}]{item.title}[/] - {error_msg}"
+                        )
+                        # Delete the corrupt file and redownload
+                        try:
+                            existing_file_path.unlink()
+                            log.info(f"Deleted corrupt file: {existing_file_path}")
+                            should_skip = False
+                            result_message = "[green]Redownloaded"
+                        except Exception as e:
+                            log.error(f"Failed to delete corrupt file: {e}")
+                            self.rich_output.console.print(
+                                f"[red]Cannot delete[/] {existing_file_path}: {e}"
+                            )
+                            return None, False
+
+                if should_skip:
+                    self.rich_output.show_item_result(
+                        result_message="[yellow]Exists",
+                        item_description=f"[{vibrant_color}]{item.title}",
+                        item_path=existing_file_path,
+                    )
+                    return existing_file_path, False
 
         elif (isinstance(item, Video) and self.videos_filter == "none") or (
             isinstance(item, Track) and self.videos_filter == "only"

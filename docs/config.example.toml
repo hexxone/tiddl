@@ -95,6 +95,23 @@ cover = false
 # only works when downloading album
 album_review = false
 
+[metadata.enrichment]
+# fetch additional metadata from external APIs
+# this includes: BPM, musical key, Camelot notation, genres, mood
+
+# enable metadata enrichment (disabled by default)
+# can also be enabled per-download with --enrich flag
+enable = true
+
+# use MusicBrainz for genres and tags (free, no API key needed)
+# looks up tracks by ISRC code or searches by title/artist
+musicbrainz = true
+
+# use GetSongBPM for musical key and Camelot notation
+# requires free API key from https://getsongbpm.com/api
+# configure with: tiddl auth getsongbpm-setup
+getsongbpm = false
+
 
 [cover]
 # please don't confuse the cover from metadata with cover as a distinct file.

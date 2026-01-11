@@ -21,6 +21,10 @@ class Metadata:
     date: str
     isrc: str
     bpm: str | None = None
+    key: str | None = None  # Musical key (e.g., "Am", "C#", "F")
+    key_camelot: str | None = None  # Camelot notation (e.g., "8B", "5A")
+    genres: list[str] = field(default_factory=list)  # Genre tags
+    mood: str | None = None  # Mood tag
     lyrics: str | None = None
     credits: list[AlbumItemsCredits.ItemWithCredits.CreditsEntry] = field(
         default_factory=list
@@ -60,11 +64,29 @@ def add_flac_metadata(track_path: Path, metadata: Metadata) -> None:
         }
     )
 
+    # BPM
     if metadata.bpm:
         mutagen["BPM"] = metadata.bpm
+
+    # Musical key (INITIALKEY is the standard Vorbis comment for key)
+    if metadata.key:
+        mutagen["INITIALKEY"] = metadata.key
+    if metadata.key_camelot:
+        mutagen["KEY"] = metadata.key_camelot  # Camelot notation
+
+    # Genres (GENRE is standard, can have multiple values)
+    if metadata.genres:
+        mutagen["GENRE"] = metadata.genres
+
+    # Mood
+    if metadata.mood:
+        mutagen["MOOD"] = metadata.mood
+
+    # Lyrics
     if metadata.lyrics:
         mutagen["LYRICS"] = metadata.lyrics
 
+    # Credits
     for entry in metadata.credits:
         mutagen[entry.type.upper()] = [c.name for c in entry.contributors]
 
@@ -100,8 +122,30 @@ def add_m4a_metadata(track_path: Path, metadata: Metadata) -> None:
         }
     )
 
+    # BPM
     if metadata.bpm:
         mutagen["bpm"] = metadata.bpm
+
+    # Genre (EasyMP4 supports genre)
+    if metadata.genres:
+        mutagen["genre"] = metadata.genres[0] if metadata.genres else ""
+
+    mutagen.save()
+
+    # For M4A, some tags need to be set directly on MP4
+    # Key and additional genres aren't standard in iTunes tags
+    # but we can add them as freeform atoms
+    mutagen = MutagenMP4(track_path)
+
+    # Musical key (using freeform atom)
+    if metadata.key:
+        mutagen["----:com.apple.iTunes:INITIALKEY"] = [metadata.key.encode("utf-8")]
+    if metadata.key_camelot:
+        mutagen["----:com.apple.iTunes:KEY"] = [metadata.key_camelot.encode("utf-8")]
+
+    # Mood (freeform atom)
+    if metadata.mood:
+        mutagen["----:com.apple.iTunes:MOOD"] = [metadata.mood.encode("utf-8")]
 
     mutagen.save()
 
@@ -136,11 +180,18 @@ def add_track_metadata(
         list[AlbumItemsCredits.ItemWithCredits.CreditsEntry] | None
     ) = None,
     comment: str = "",
+    key: str | None = None,
+    key_camelot: str | None = None,
+    genres: list[str] | None = None,
+    mood: str | None = None,
 ) -> None:
     """Add FLAC or M4A metadata based on file extension."""
 
     if credits_contributors is None:
         credits_contributors = []
+
+    if genres is None:
+        genres = []
 
     sort_credits_contributors(credits_contributors)
 
@@ -155,6 +206,10 @@ def add_track_metadata(
         date=date,
         isrc=track.isrc,
         bpm=str(track.bpm or ""),
+        key=key,
+        key_camelot=key_camelot,
+        genres=genres,
+        mood=mood,
         lyrics=lyrics or None,
         cover_data=cover_data,
         credits=credits_contributors,

@@ -8,7 +8,7 @@ from rich.live import Live
 
 from typing_extensions import Annotated
 
-from tiddl.core.metadata import add_track_metadata, add_video_metadata, Cover
+from tiddl.core.metadata import add_track_metadata, add_video_metadata, Cover, get_enrichment_service
 from tiddl.core.api import ApiError
 from tiddl.core.api.models import Album, Track, Video, AlbumItemsCredits
 from tiddl.core.utils.format import format_template
@@ -29,6 +29,35 @@ from tiddl.cli.commands.subcommands import register_subcommands
 
 from .downloader import Downloader
 from .output import RichOutput
+
+
+def get_playlist_creator_name(api, playlist) -> str:
+    """
+    Fetch the creator name for a playlist.
+    Returns the display name or falls back to the creator ID as a string.
+    The result is cached by the API layer for 24 hours.
+    """
+    try:
+        # Extract creator ID from playlist
+        creator_id = None
+        if hasattr(playlist.creator, "id"):
+            creator_id = playlist.creator.id
+        elif isinstance(playlist.creator, dict) and "id" in playlist.creator:
+            creator_id = playlist.creator["id"]
+
+        if creator_id:
+            user_profile = api.get_user_profile(creator_id)
+            return user_profile.display_name
+    except Exception as e:
+        log.debug(f"Failed to fetch creator name: {e}")
+
+    # Fallback to creator ID as string
+    if hasattr(playlist.creator, "id"):
+        return str(playlist.creator.id)
+    elif isinstance(playlist.creator, dict) and "id" in playlist.creator:
+        return str(playlist.creator["id"])
+    return ""
+
 
 download_command = typer.Typer(name="download")
 register_subcommands(download_command)
@@ -126,6 +155,20 @@ def download_callback(
             help="Skip unavailable items and continue downloading the rest.",
         ),
     ] = False,
+    VERIFY_EXISTING: Annotated[
+        bool,
+        typer.Option(
+            "--verify/--no-verify",
+            help="Verify existing files with ffprobe before skipping. Corrupted files are deleted and redownloaded.",
+        ),
+    ] = True,
+    ENRICH_METADATA: Annotated[
+        bool,
+        typer.Option(
+            "--enrich/--no-enrich",
+            help="Fetch additional metadata (genres, key, BPM) from MusicBrainz and GetSongBPM APIs.",
+        ),
+    ] = CONFIG.metadata.enrichment.enable,
 ):
     """
     Download Tidal resources.
@@ -193,6 +236,7 @@ def download_callback(
             skip_existing=not SKIP_EXISTING,
             download_path=DOWNLOAD_PATH,
             scan_path=SCAN_PATH,
+            verify_existing=VERIFY_EXISTING,
         )
 
         class Metadata:
@@ -209,6 +253,14 @@ def download_callback(
                 self.credits = credits
                 self.cover = cover
                 self.album_review = album_review
+
+        # Initialize enrichment service if enabled
+        enrichment_service = None
+        if ENRICH_METADATA:
+            enrichment_service = get_enrichment_service(
+                use_musicbrainz=CONFIG.metadata.enrichment.musicbrainz,
+                use_getsongbpm=CONFIG.metadata.enrichment.getsongbpm,
+            )
 
         async def handle_resource(resource: TidalResource):
             async def handle_item(
@@ -255,6 +307,29 @@ def download_callback(
                         if track_metadata.cover and track_metadata.cover.data is None:
                             track_metadata.cover.fetch_data()
 
+                        # Fetch enriched metadata from external APIs
+                        enriched_key = None
+                        enriched_key_camelot = None
+                        enriched_genres: list[str] = []
+                        enriched_mood = None
+
+                        if enrichment_service:
+                            try:
+                                primary_artist = item.artists[0].name if item.artists else ""
+                                enriched = enrichment_service.enrich_track(
+                                    title=item.title,
+                                    artist=primary_artist,
+                                    isrc=item.isrc,
+                                    duration_ms=item.duration * 1000 if item.duration else None,
+                                    tidal_bpm=item.bpm,
+                                )
+                                enriched_key = enriched.key or None
+                                enriched_key_camelot = enriched.key_camelot or None
+                                enriched_genres = enriched.genres
+                                enriched_mood = enriched.mood or None
+                            except Exception as e:
+                                log.warning(f"Metadata enrichment failed for '{item.title}': {e}")
+
                         add_track_metadata(
                             path=download_path,
                             track=item,
@@ -268,6 +343,10 @@ def download_callback(
                             date=track_metadata.date,
                             credits_contributors=track_metadata.credits,
                             comment=track_metadata.album_review,
+                            key=enriched_key,
+                            key_camelot=enriched_key_camelot,
+                            genres=enriched_genres,
+                            mood=enriched_mood,
                         )
 
                     elif isinstance(item, Video):
@@ -584,6 +663,9 @@ def download_callback(
                     playlist_index = 0
                     playlist = ctx.obj.api.get_playlist(playlist_uuid=resource.id)
 
+                    # Fetch creator name once (cached by API)
+                    creator_name = get_playlist_creator_name(ctx.obj.api, playlist)
+
                     while True:
                         playlist_items = ctx.obj.api.get_playlist_items(
                             playlist_uuid=resource.id, offset=offset
@@ -611,6 +693,7 @@ def download_callback(
                                             playlist=playlist,
                                             playlist_index=playlist_index,
                                             quality=get_item_quality(playlist_item.item),
+                                            creator_name=creator_name,
                                         ),
                                         track_metadata=Metadata(),
                                     )
@@ -642,6 +725,7 @@ def download_callback(
                             CONFIG.m3u.templates.playlist,
                             playlist=playlist,
                             type="playlist",
+                            creator_name=creator_name,
                         ),
                         tracks_with_path=tracks_with_path,
                     )
@@ -658,6 +742,7 @@ def download_callback(
                             / format_template(
                                 template=CONFIG.cover.templates.playlist,
                                 playlist=playlist,
+                                creator_name=creator_name,
                             )
                         )
 

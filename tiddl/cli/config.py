@@ -28,6 +28,14 @@ class Config(BaseModel):
         cover: bool = False
         album_review: bool = False
 
+        class EnrichmentConfig(BaseModel):
+            """Settings for fetching metadata from external APIs."""
+            enable: bool = False  # Disabled by default (requires API setup)
+            musicbrainz: bool = True  # Use MusicBrainz for genres/tags
+            getsongbpm: bool = True  # Use GetSongBPM for key/BPM
+
+        enrichment: EnrichmentConfig = EnrichmentConfig()
+
     metadata: MetadataConfig = MetadataConfig()
 
     class CoverConfig(BaseModel):
@@ -45,7 +53,7 @@ class Config(BaseModel):
     cover: CoverConfig = CoverConfig()
 
     class DownloadConfig(BaseModel):
-        track_quality: TRACK_QUALITY_LITERAL = "high"
+        track_quality: TRACK_QUALITY_LITERAL = "max"
         video_quality: VIDEO_QUALITY_LITERAL = "fhd"
         skip_existing: bool = True
         threads_count: int = 4

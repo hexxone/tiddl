@@ -5,6 +5,7 @@ from rich.console import Console
 
 from tiddl.cli.utils.auth.core import load_auth_data, save_auth_data, AuthData
 from tiddl.cli.utils.spotify import load_spotify_credentials, save_spotify_credentials, SpotifyCredentials
+from tiddl.cli.utils.getsongbpm import load_getsongbpm_credentials, save_getsongbpm_credentials, GetSongBPMCredentials
 from tiddl.core.auth import AuthAPI, AuthClientError
 from tiddl.core.spotify import SpotifyClient
 
@@ -218,3 +219,82 @@ def spotify_logout():
         console.print("[bold green]Logged out from Spotify!")
     else:
         console.print("[yellow]Not logged in to Spotify.")
+
+
+@auth_command.command(help="Setup GetSongBPM API key for BPM and musical key data.")
+def getsongbpm_setup(
+    API_KEY: Annotated[
+        str,
+        typer.Option(
+            "--api-key",
+            prompt="GetSongBPM API Key",
+            help="Your GetSongBPM API key",
+        ),
+    ],
+):
+    """
+    Setup GetSongBPM API credentials.
+
+    GetSongBPM provides BPM (tempo) and musical key data for tracks.
+    The API is free but requires attribution (link back to getsongbpm.com).
+
+    To get an API key:
+    1. Go to https://getsongbpm.com/api
+    2. Register with your email
+    3. Copy your API key
+    """
+    credentials = GetSongBPMCredentials(api_key=API_KEY)
+    save_getsongbpm_credentials(credentials)
+    console.print("[bold green]GetSongBPM API key saved!")
+    console.print()
+    console.print("[yellow]Important:[/] GetSongBPM requires attribution.")
+    console.print("Please add a link to https://getsongbpm.com in your project.")
+
+
+@auth_command.command(help="Remove GetSongBPM API key.")
+def getsongbpm_logout():
+    credentials = load_getsongbpm_credentials()
+
+    if credentials.api_key:
+        save_getsongbpm_credentials(GetSongBPMCredentials())
+        console.print("[bold green]GetSongBPM API key removed!")
+    else:
+        console.print("[yellow]No GetSongBPM API key configured.")
+
+
+@auth_command.command(help="Show status of all authentication.")
+def status():
+    """Show the status of all authentication credentials."""
+    console.print("[bold]Authentication Status:[/]\n")
+
+    # Tidal
+    tidal_auth = load_auth_data()
+    if tidal_auth.token:
+        expiry = datetime.fromtimestamp(tidal_auth.expires_at)
+        console.print(f"  [green]Tidal:[/] Logged in (expires {expiry.strftime('%Y-%m-%d %H:%M')})")
+    else:
+        console.print("  [red]Tidal:[/] Not logged in")
+
+    # Spotify
+    spotify_creds = load_spotify_credentials()
+    if spotify_creds.client_id:
+        from tiddl.cli.const import APP_PATH
+        cache_path = APP_PATH / ".spotify_cache"
+        if cache_path.exists():
+            console.print("  [green]Spotify:[/] Configured and logged in")
+        else:
+            console.print("  [yellow]Spotify:[/] Configured but not logged in")
+    else:
+        console.print("  [red]Spotify:[/] Not configured")
+
+    # GetSongBPM
+    getsongbpm_creds = load_getsongbpm_credentials()
+    if getsongbpm_creds.api_key:
+        # Mask the API key
+        masked_key = getsongbpm_creds.api_key[:4] + "..." + getsongbpm_creds.api_key[-4:]
+        console.print(f"  [green]GetSongBPM:[/] Configured (key: {masked_key})")
+    else:
+        console.print("  [red]GetSongBPM:[/] Not configured")
+
+    # MusicBrainz (no auth needed)
+    console.print("  [green]MusicBrainz:[/] No authentication required")

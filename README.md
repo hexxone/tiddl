@@ -65,13 +65,14 @@ $ tiddl
 
 - 🎵 Download tracks, videos, albums, artists, playlists, and mixes from Tidal
 - 🎧 Support for maximum audio quality (up to 24-bit, 192 kHz FLAC)
-- 🔄 **NEW: Migrate playlists from Spotify to Tidal**
+- 🔄 **Migrate playlists from Spotify to Tidal** with interactive selection
 - 📝 Automatic metadata tagging with lyrics support
+- 🎹 **Extended metadata**: BPM, musical key, Camelot notation, genres, mood
 - 🎨 Cover art embedding and saving
 - 🔍 Smart file organization with custom templates
 - ⚡ Concurrent downloads with configurable thread count
-- 🚫 Skip existing files to avoid re-downloading
-- 📋 M3U playlist generation
+- 🚫 Skip existing files with automatic integrity verification
+- 📋 M3U playlist generation with portable relative paths
 
 ## Authentication
 
@@ -100,6 +101,27 @@ To migrate playlists from Spotify, you need to set up Spotify API credentials:
 
 See [Spotify Migration Guide](docs/spotify_migration.md) for detailed instructions.
 
+### GetSongBPM API (Optional)
+
+To enable musical key detection (e.g., "Am", "C#") and Camelot notation (e.g., "8A", "5B") in your downloaded files, set up a GetSongBPM API key:
+
+1. Get a free API key from [GetSongBPM](https://getsongbpm.com/api)
+2. Configure the API key:
+   ```bash
+   tiddl auth getsongbpm-setup
+   ```
+
+> [!NOTE]
+> GetSongBPM is free but requires attribution. MusicBrainz (for genres/tags) requires no API key.
+
+### Check Authentication Status
+
+View the status of all configured services:
+
+```bash
+tiddl auth status
+```
+
 ## Migrating from Spotify
 
 Migrate your Spotify playlists to Tidal and automatically download them:
@@ -110,14 +132,20 @@ tiddl migrate spotify-to-tidal
 
 This will:
 1. Fetch all your Spotify playlists
-2. Let you select which ones to migrate
+2. Let you interactively select which ones to migrate (toggle on/off)
 3. Convert tracks from Spotify to Tidal
 4. Create/update playlists in Tidal (Spotify is source of truth)
 5. Download the migrated playlists
 
+**Interactive Selection:**
+- Toggle playlists by number: `1,2,3` or `1-5`
+- Toggle by owner: `@username` (selects all playlists by that user)
+- Quick commands: `all`, `none`, `mine`, `invert`
+
 **Options:**
 - `--dry-run`: Preview without making changes
 - `--no-download`: Migrate without downloading
+- `--select <selection>`: Non-interactive mode (e.g., `--select mine`)
 
 See the [Spotify Migration Guide](docs/spotify_migration.md) for complete details.
 
@@ -145,6 +173,56 @@ tiddl download url <url> --skip-errors
 ```
 
 Skipped items are logged with track/album name and IDs for reference.
+
+### File Integrity Verification
+
+By default, tiddl verifies existing files using ffprobe before skipping them. If a file is corrupted or incomplete, it will be automatically deleted and redownloaded:
+
+```bash
+# Default behavior - verifies existing files
+tiddl download url <url>
+
+# Disable verification for faster skipping (not recommended)
+tiddl download url <url> --no-verify
+```
+
+The verification checks:
+- File exists and has content
+- ffprobe can parse the file (valid audio format)
+- File contains an audio stream
+- Duration matches expected length
+
+### Metadata Enrichment
+
+tiddl can fetch additional metadata from external APIs and embed it in your audio files:
+
+```bash
+# Enable metadata enrichment
+tiddl download url <url> --enrich
+```
+
+**Sources:**
+- **Tidal API**: BPM (when available)
+- **MusicBrainz**: Genres and tags (lookup by ISRC, no API key needed)
+- **GetSongBPM**: Musical key and Camelot notation (requires free API key)
+
+**Embedded tags:**
+| Tag | FLAC | M4A | Description |
+|-----|------|-----|-------------|
+| BPM | `BPM` | `bpm` | Tempo in beats per minute |
+| Key | `INITIALKEY` | iTunes atom | Musical key (e.g., "Am", "C#") |
+| Camelot | `KEY` | iTunes atom | Camelot notation (e.g., "8A", "5B") |
+| Genre | `GENRE` | `genre` | Music genres |
+| Mood | `MOOD` | iTunes atom | Mood tag (e.g., "Energetic") |
+
+To enable enrichment by default, add to your `config.toml`:
+
+```toml
+[metadata.enrichment]
+enable = true
+musicbrainz = true   # Genres/tags (free)
+getsongbpm = true    # Key/BPM (requires API key)
+```
 
 ### Quality
 
@@ -184,6 +262,23 @@ Music
 
 > [!NOTE]
 > Learn more about [file templating](/docs/templating.md)
+
+### M3U Playlists
+
+tiddl can generate M3U playlist files for downloaded albums and playlists. These files use **relative paths** by default, making them portable - you can move your music folder and the playlists will still work.
+
+To fix existing M3U files that use absolute paths:
+
+```bash
+# Preview what would be changed
+tiddl migrate fix-m3u --dry-run
+
+# Fix all M3U files in the default directory
+tiddl migrate fix-m3u
+
+# Fix M3U files in a custom directory
+tiddl migrate fix-m3u --m3u-dir /path/to/m3u
+```
 
 ## Configuration files
 

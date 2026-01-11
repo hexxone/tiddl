@@ -24,6 +24,7 @@ from .models.resources import (
     StreamVideoQuality,
     Track,
     TrackQuality,
+    UserProfile,
     Video,
 )
 from .models.review import AlbumReview
@@ -252,6 +253,18 @@ class TidalAPI:
                 "assetpresentation": "FULL",
             },
             expire_after=DO_NOT_CACHE,
+        )
+
+    def get_user_profile(self, user_id: ID) -> UserProfile:
+        """
+        Get user profile information.
+        Results are cached for 24 hours to minimize API calls.
+        """
+        return self.client.fetch(
+            UserProfile,
+            f"users/{user_id}",
+            {"countryCode": self.country_code},
+            expire_after=86400,  # Cache for 24 hours
         )
 
     def _request(self, method: str, endpoint: str, **kwargs) -> "requests.Response":

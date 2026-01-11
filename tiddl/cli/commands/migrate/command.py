@@ -35,6 +35,7 @@ from .tracks import (
 )
 from .report import PlaylistReportCollector
 from .ui import MigrationUI
+from .selection import interactive_playlist_selection
 
 console = Console()
 log = getLogger(__name__)
@@ -173,16 +174,38 @@ def spotify_to_tidal(
             help="Use split-screen UI showing migration and download progress side-by-side.",
         ),
     ] = True,
+    INTERACTIVE: Annotated[
+        bool,
+        typer.Option(
+            "--interactive/--no-interactive",
+            "-i",
+            help="Interactive playlist selection with toggle support. Use @owner to select by owner.",
+        ),
+    ] = True,
+    SELECT: Annotated[
+        Optional[str],
+        typer.Option(
+            "--select",
+            "-s",
+            help="Pre-select playlists (non-interactive). Use: 'all', 'mine', '1,2,3', or '1-5'.",
+        ),
+    ] = None,
 ):
     """
     Migrate playlists from Spotify to Tidal and optionally download them.
 
     This command will:
     1. Fetch all your Spotify playlists
-    2. Let you select which ones to migrate
+    2. Let you select which ones to migrate (interactive toggle or --select)
     3. Convert tracks from Spotify to Tidal using Odesli API
     4. Create/update playlists in Tidal
     5. Optionally download the migrated playlists
+
+    Interactive selection commands:
+      - Numbers (1,2,3) to toggle specific playlists
+      - Ranges (1-5) to toggle a range
+      - @owner to toggle all playlists by that owner
+      - 'all', 'none', 'mine', 'invert' for bulk operations
     """
 
     # Load Spotify credentials and check authentication
@@ -245,70 +268,125 @@ def spotify_to_tidal(
 
     console.print(f"[green]Found {len(playlists)} playlist(s)[/] ([cyan]{owned_count} owned by you[/])\n")
 
-    # Display playlists in a table
-    table = Table(title="Your Spotify Playlists", show_header=True, header_style="bold magenta")
-    table.add_column("#", style="dim", width=6)
-    table.add_column("Name", style="cyan")
-    table.add_column("Tracks", justify="right", style="green")
-    table.add_column("Owner", style="yellow")
-
-    for idx, playlist in enumerate(playlists, 1):
-        owner_name = playlist['owner']['display_name'] or playlist['owner']['id']
-        is_owner = user_id and playlist['owner']['id'] == user_id
-
-        # Mark owned playlists
-        if is_owner:
-            owner_name = f"[bold green]★ {owner_name}[/]"
-
-        table.add_row(
-            str(idx),
-            playlist['name'],
-            str(playlist['tracks']['total']),
-            owner_name
-        )
-
-    console.print(table)
-    console.print()
-
-    # Build default selection (owned playlists)
-    default_indices = [str(i+1) for i, p in enumerate(playlists) if user_id and p['owner']['id'] == user_id]
-    default_selection = ','.join(default_indices) if default_indices else 'none'
-
     # Playlist selection
-    console.print("[bold]Select playlists to migrate:[/]")
-    console.print("Enter playlist numbers separated by commas (e.g., 1,3,5)")
-    console.print("Or enter 'all' to migrate all playlists")
-    console.print("Or enter 'mine' to migrate only your own playlists (default)")
-    console.print("Or enter 'none' to cancel")
-    console.print(f"[dim]★ = Owned by you[/]\n")
-
-    selection = typer.prompt("Your selection", default=default_selection if default_selection != 'none' else 'mine')
-
-    if selection.lower() == 'none':
-        console.print("[yellow]Migration cancelled.")
-        raise typer.Exit()
-
-    # Parse selection
     selected_playlists = []
 
-    if selection.lower() == 'all':
-        selected_playlists = playlists
-    elif selection.lower() == 'mine':
-        selected_playlists = [p for p in playlists if user_id and p['owner']['id'] == user_id]
-        if not selected_playlists:
-            console.print("[yellow]You don't own any playlists.")
+    if SELECT:
+        # Non-interactive mode with --select option
+        selection = SELECT.lower().strip()
+
+        # Display playlists in a simple table first
+        table = Table(title="Your Spotify Playlists", show_header=True, header_style="bold magenta")
+        table.add_column("#", style="dim", width=6)
+        table.add_column("Name", style="cyan")
+        table.add_column("Tracks", justify="right", style="green")
+        table.add_column("Owner", style="yellow")
+
+        for idx, playlist in enumerate(playlists, 1):
+            owner_name = playlist['owner']['display_name'] or playlist['owner']['id']
+            is_owner = user_id and playlist['owner']['id'] == user_id
+            if is_owner:
+                owner_name = f"[bold green]★ {owner_name}[/]"
+            table.add_row(
+                str(idx),
+                playlist['name'],
+                str(playlist['tracks']['total']),
+                owner_name
+            )
+
+        console.print(table)
+        console.print()
+
+        if selection == 'all':
+            selected_playlists = playlists
+        elif selection == 'mine':
+            selected_playlists = [p for p in playlists if user_id and p['owner']['id'] == user_id]
+            if not selected_playlists:
+                console.print("[yellow]You don't own any playlists.")
+                raise typer.Exit()
+        elif selection == 'none':
+            console.print("[yellow]Migration cancelled.")
             raise typer.Exit()
+        else:
+            # Parse numbers and ranges
+            try:
+                parts = [p.strip() for p in selection.replace(' ', ',').split(',') if p.strip()]
+                indices = set()
+                for part in parts:
+                    if '-' in part:
+                        start, end = part.split('-', 1)
+                        for i in range(int(start), int(end) + 1):
+                            indices.add(i)
+                    else:
+                        indices.add(int(part))
+
+                for idx in sorted(indices):
+                    if 1 <= idx <= len(playlists):
+                        selected_playlists.append(playlists[idx - 1])
+                    else:
+                        console.print(f"[yellow]Warning: Invalid playlist number {idx}, skipping.")
+            except ValueError:
+                console.print("[bold red]Invalid selection format!")
+                raise typer.Exit()
+
+    elif INTERACTIVE:
+        # Interactive selection mode (default)
+        selected_playlists = interactive_playlist_selection(
+            console=console,
+            playlists=playlists,
+            user_id=user_id,
+            default_mine=True,
+        )
     else:
-        try:
-            indices = [int(x.strip()) for x in selection.split(',')]
-            for idx in indices:
-                if 1 <= idx <= len(playlists):
-                    selected_playlists.append(playlists[idx - 1])
-                else:
-                    console.print(f"[yellow]Warning: Invalid playlist number {idx}, skipping.")
-        except ValueError:
-            console.print("[bold red]Invalid selection format!")
+        # Fallback: simple prompt (when --no-interactive and no --select)
+        table = Table(title="Your Spotify Playlists", show_header=True, header_style="bold magenta")
+        table.add_column("#", style="dim", width=6)
+        table.add_column("Name", style="cyan")
+        table.add_column("Tracks", justify="right", style="green")
+        table.add_column("Owner", style="yellow")
+
+        for idx, playlist in enumerate(playlists, 1):
+            owner_name = playlist['owner']['display_name'] or playlist['owner']['id']
+            is_owner = user_id and playlist['owner']['id'] == user_id
+            if is_owner:
+                owner_name = f"[bold green]★ {owner_name}[/]"
+            table.add_row(
+                str(idx),
+                playlist['name'],
+                str(playlist['tracks']['total']),
+                owner_name
+            )
+
+        console.print(table)
+        console.print()
+
+        default_indices = [str(i+1) for i, p in enumerate(playlists) if user_id and p['owner']['id'] == user_id]
+        default_selection = ','.join(default_indices) if default_indices else 'mine'
+
+        console.print("[bold]Select playlists to migrate:[/]")
+        console.print("Enter playlist numbers separated by commas (e.g., 1,3,5)")
+        console.print("Or enter 'all', 'mine', or 'none'")
+        console.print(f"[dim]★ = Owned by you[/]\n")
+
+        selection = typer.prompt("Your selection", default=default_selection)
+        selection = selection.lower().strip()
+
+        if selection == 'none':
+            console.print("[yellow]Migration cancelled.")
             raise typer.Exit()
+        elif selection == 'all':
+            selected_playlists = playlists
+        elif selection == 'mine':
+            selected_playlists = [p for p in playlists if user_id and p['owner']['id'] == user_id]
+        else:
+            try:
+                indices = [int(x.strip()) for x in selection.split(',')]
+                for idx in indices:
+                    if 1 <= idx <= len(playlists):
+                        selected_playlists.append(playlists[idx - 1])
+            except ValueError:
+                console.print("[bold red]Invalid selection format!")
+                raise typer.Exit()
 
     if not selected_playlists:
         console.print("[yellow]No playlists selected.")
@@ -966,3 +1044,104 @@ def cleanup_duplicates(
         console.print(f"\n[bold yellow]DRY RUN SUMMARY: Would remove {total_duplicates_removed} duplicate(s) total[/]")
     else:
         console.print(f"\n[bold green]Cleanup complete! Removed {total_duplicates_removed} duplicate(s) total[/]")
+
+
+@migrate_command.command(help="Fix M3U playlists to use relative paths.")
+def fix_m3u(
+    M3U_DIR: Annotated[
+        Path,
+        typer.Option(
+            "--m3u-dir",
+            "-d",
+            help="Directory containing M3U files to fix.",
+        ),
+    ] = Path.home() / "Music" / "tiddl" / "m3u",
+    RECURSIVE: Annotated[
+        bool,
+        typer.Option(
+            "--recursive/--no-recursive",
+            "-r",
+            help="Search for M3U files recursively in subdirectories.",
+        ),
+    ] = True,
+    DRY_RUN: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would be changed without actually modifying files.",
+        ),
+    ] = False,
+):
+    """
+    Fix existing M3U playlist files to use relative paths.
+
+    This command scans for M3U files and rewrites them to use paths
+    relative to the M3U file location instead of absolute paths.
+    This makes playlists portable and usable when moved to different locations.
+
+    Example:
+        Before: /Users/john/Music/tiddl/Artist/Album/Song.flac
+        After:  ../../Artist/Album/Song.flac
+    """
+    from tiddl.core.utils.m3u import regenerate_m3u_with_relative_paths
+
+    if not M3U_DIR.exists():
+        console.print(f"[red]Directory does not exist: {M3U_DIR}[/]")
+        raise typer.Exit(1)
+
+    # Find all M3U files
+    if RECURSIVE:
+        m3u_files = list(M3U_DIR.rglob("*.m3u"))
+    else:
+        m3u_files = list(M3U_DIR.glob("*.m3u"))
+
+    if not m3u_files:
+        console.print(f"[yellow]No M3U files found in {M3U_DIR}[/]")
+        raise typer.Exit()
+
+    console.print(f"[cyan]Found {len(m3u_files)} M3U file(s)[/]\n")
+
+    if DRY_RUN:
+        console.print("[yellow]DRY RUN - No changes will be made[/]\n")
+
+    fixed_count = 0
+    error_count = 0
+
+    for m3u_file in m3u_files:
+        relative_path = m3u_file.relative_to(M3U_DIR) if m3u_file.is_relative_to(M3U_DIR) else m3u_file.name
+
+        if DRY_RUN:
+            # Just check if file has absolute paths
+            try:
+                content = m3u_file.read_text(encoding="utf-8")
+                has_absolute = any(
+                    line.startswith("/") or (len(line) > 2 and line[1] == ":")
+                    for line in content.splitlines()
+                    if line and not line.startswith("#")
+                )
+                if has_absolute:
+                    console.print(f"  [yellow]Would fix:[/] {relative_path}")
+                    fixed_count += 1
+                else:
+                    console.print(f"  [dim]Already relative:[/] {relative_path}")
+            except Exception as e:
+                console.print(f"  [red]Error reading:[/] {relative_path} - {e}")
+                error_count += 1
+        else:
+            try:
+                success = regenerate_m3u_with_relative_paths(m3u_file)
+                if success:
+                    console.print(f"  [green]Fixed:[/] {relative_path}")
+                    fixed_count += 1
+                else:
+                    console.print(f"  [red]Failed:[/] {relative_path}")
+                    error_count += 1
+            except Exception as e:
+                console.print(f"  [red]Error:[/] {relative_path} - {e}")
+                error_count += 1
+
+    console.print()
+    if DRY_RUN:
+        console.print(f"[bold yellow]DRY RUN: Would fix {fixed_count} file(s), {error_count} error(s)[/]")
+    else:
+        console.print(f"[bold green]Fixed {fixed_count} file(s), {error_count} error(s)[/]")
