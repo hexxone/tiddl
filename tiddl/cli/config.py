@@ -82,16 +82,16 @@ class Config(BaseModel):
         allowed: list[VALID_M3U_RESOURCE_LITERAL] = []
 
         class M3UTemplatesConfig(BaseModel):
-            album: str = ""
-            playlist: str = ""
-            mix: str = ""
+            album: str = "m3u/album/{album.artist}/{album.title}"
+            playlist: str = "m3u/playlist/{playlist.creator_name}/{playlist.title}"
+            mix: str = "m3u/mix/{mix_id}"
 
         templates: M3UTemplatesConfig = M3UTemplatesConfig()
 
     m3u: M3UConfig = M3UConfig()
 
     class TemplatesConfig(BaseModel):
-        default: str = "{album.artist}/{album.title}/{item.title}"
+        default: str = "media/{album.artist}/{album.title}/{item.title}"
         track: str = ""
         video: str = ""
         album: str = ""

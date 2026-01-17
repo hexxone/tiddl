@@ -24,13 +24,14 @@ debug = false
 
 # if you don't specify the template for a resource
 # then default template will be used.
-default = "{album.artist}/{album.title}/{item.title}"
+# audio files are placed in the "media" subfolder by default
+default = "media/{album.artist}/{album.title}/{item.title}"
 
-# track = "tracks/{item.id}"
-# video = "videos/{item.title}"
-# album = "artists/{album.artist}/{album.title}/{item.title}"
-# playlist = "{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
-# mix = "mixes/{mix_id}/{item.artist} - {item.title}"
+# track = "media/{item.artist}/{item.title}"
+# video = "media/videos/{item.title}"
+# album = "media/{album.artist}/{album.title}/{item.title}"
+# playlist = "media/{playlist.creator_name}/{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
+# mix = "media/mixes/{mix_id}/{item.artist} - {item.title}"
 
 
 [download]
@@ -154,9 +155,9 @@ save = false
 allowed = ["album", "mix", "playlist"]
 
 [m3u.templates]
-# additional template values:
-# {type} - album/playlist/mix
+# M3U files are organized by type in the m3u subfolder
+# playlist.creator_name is automatically fetched from Tidal API
 
-album = "m3u/{type}/{album.artist} - {album.title}"
-playlist = "m3u/{type}/{playlist.title}"
-mix = "m3u/{type}/{now:%x}"
+album = "m3u/album/{album.artist}/{album.title}"
+playlist = "m3u/playlist/{playlist.creator_name}/{playlist.title}"
+mix = "m3u/mix/{mix_id}"

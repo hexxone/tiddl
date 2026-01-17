@@ -230,22 +230,41 @@ def create_track_report_from_spotify(spotify_track: dict) -> TrackReport:
 
 
 def write_playlist_csv(
-    log_dir: Path,
-    playlist_name: str,
     tracks: list[TrackReport],
-):
+    csv_path: Path | None = None,
+    log_dir: Path | None = None,
+    playlist_name: str = "",
+) -> Path | None:
     """
     Write a CSV report for a playlist.
+
+    Args:
+        tracks: List of track reports to write
+        csv_path: Direct path to save the CSV file (preferred)
+        log_dir: Fallback directory if csv_path not provided
+        playlist_name: Playlist name for fallback filename
+
+    Returns:
+        Path to the written CSV file, or None if failed
     """
-    # Sanitize playlist name for filename
-    safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in playlist_name)
-    safe_name = safe_name.strip().replace(" ", "-")[:100]
-
-    csv_file = log_dir / f"pl-{safe_name}.csv"
-
     if not tracks:
         log.warning(f"No tracks to write for playlist {playlist_name}")
-        return
+        return None
+
+    # Determine the CSV file path
+    if csv_path:
+        csv_file = csv_path
+    elif log_dir and playlist_name:
+        # Fallback: sanitize playlist name for filename
+        safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in playlist_name)
+        safe_name = safe_name.strip().replace(" ", "-")[:100]
+        csv_file = log_dir / f"pl-{safe_name}.csv"
+    else:
+        log.error("No valid path provided for CSV report")
+        return None
+
+    # Ensure parent directory exists
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Get field names from dataclass
     fieldnames = list(asdict(tracks[0]).keys())
@@ -259,9 +278,11 @@ def write_playlist_csv(
 
         log.debug(f"Wrote CSV report to {csv_file}")
         console.print(f"  [dim]CSV report: {csv_file}[/]")
+        return csv_file
     except Exception as e:
         log.error(f"Failed to write CSV report {csv_file}: {e}")
         console.print(f"  [yellow]Warning: Failed to write CSV: {e}[/]")
+        return None
 
 
 def update_track_with_download_metadata(
@@ -321,11 +342,20 @@ class PlaylistReportCollector:
         self.download_path = download_path
         self._playlists: dict[str, list[TrackReport]] = {}  # playlist_name -> tracks
         self._playlist_uuids: dict[str, str] = {}  # playlist_name -> tidal_uuid
+        self._playlist_csv_paths: dict[str, Path] = {}  # playlist_name -> csv_path
 
-    def start_playlist(self, playlist_name: str, tidal_uuid: str = ""):
-        """Start collecting tracks for a new playlist."""
+    def start_playlist(self, playlist_name: str, tidal_uuid: str = "", csv_path: Path | None = None):
+        """Start collecting tracks for a new playlist.
+
+        Args:
+            playlist_name: Name of the playlist
+            tidal_uuid: Tidal playlist UUID
+            csv_path: Optional path where CSV should be saved (next to M3U file)
+        """
         self._playlists[playlist_name] = []
         self._playlist_uuids[playlist_name] = tidal_uuid
+        if csv_path:
+            self._playlist_csv_paths[playlist_name] = csv_path
 
     def add_track(
         self,
@@ -370,9 +400,13 @@ class PlaylistReportCollector:
         """
         Finalize all playlist reports and write CSVs.
         If scan_downloads is True, extract metadata from downloaded files.
+
+        CSV files are saved next to M3U files if csv_path was provided during start_playlist,
+        otherwise they fall back to the log_dir.
         """
         console.print("\n[cyan]Generating CSV reports...[/]")
 
+        written_paths = []
         for playlist_name, tracks in self._playlists.items():
             if not tracks:
                 continue
@@ -383,10 +417,23 @@ class PlaylistReportCollector:
                     if track.download_status == "downloaded" and track.tidal_id:
                         tracks[i] = update_track_with_download_metadata(track, self.download_path)
 
-            # Write CSV
-            write_playlist_csv(self.log_dir, playlist_name, tracks)
+            # Get the CSV path (prefer stored path, fallback to log_dir)
+            csv_path = self._playlist_csv_paths.get(playlist_name)
 
-        console.print(f"[green]Generated {len(self._playlists)} CSV report(s) in {self.log_dir}[/]")
+            # Write CSV
+            result = write_playlist_csv(
+                tracks=tracks,
+                csv_path=csv_path,
+                log_dir=self.log_dir,
+                playlist_name=playlist_name,
+            )
+            if result:
+                written_paths.append(result)
+
+        if written_paths:
+            # Show summary with the primary location
+            primary_location = written_paths[0].parent if written_paths else self.log_dir
+            console.print(f"[green]Generated {len(written_paths)} CSV report(s)[/]")
 
     @property
     def playlist_names(self) -> list[str]:

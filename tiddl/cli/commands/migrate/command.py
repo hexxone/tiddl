@@ -20,7 +20,9 @@ from typing_extensions import Annotated
 from tiddl.cli.utils.spotify import load_spotify_credentials
 from tiddl.core.spotify import SpotifyClient, SpotifyAPI
 from tiddl.core.odesli import OdesliClient
+from tiddl.core.utils.format import format_template
 from tiddl.cli.ctx import Context
+from tiddl.cli.config import CONFIG
 
 from .downloader import PlaylistDownloader
 from .playlist import (
@@ -39,6 +41,36 @@ from .selection import interactive_playlist_selection
 
 console = Console()
 log = getLogger(__name__)
+
+
+def _compute_csv_path_for_playlist(ctx: Context, tidal_playlist_uuid: str, download_path: Path) -> Path | None:
+    """
+    Compute the CSV path based on the M3U template.
+    Returns a path like: download_path/m3u/playlist/{creator_name}/{playlist_title}.csv
+    """
+    try:
+        # Fetch the Tidal playlist
+        playlist = ctx.obj.api.get_playlist(tidal_playlist_uuid)
+
+        # Get creator name
+        from tiddl.cli.commands.download import get_playlist_creator_name
+        creator_name = get_playlist_creator_name(ctx.obj.api, playlist)
+
+        # Use the M3U playlist template to compute the path
+        m3u_path = format_template(
+            template=CONFIG.m3u.templates.playlist,
+            playlist=playlist,
+            creator_name=creator_name,
+            with_asterisk_ext=False,
+        )
+
+        # Replace .m3u extension with .csv (or just add .csv if no extension)
+        csv_path = download_path / (m3u_path + ".csv")
+        return csv_path
+    except Exception as e:
+        log.warning(f"Could not compute CSV path from M3U template: {e}")
+        return None
+
 
 migrate_command = typer.Typer(
     name="migrate", help="Migrate playlists from Spotify to Tidal.", no_args_is_help=True
@@ -635,7 +667,13 @@ def migrate_playlist(
 
     # Start collecting track reports for this playlist
     if report_collector:
-        report_collector.start_playlist(playlist_name, tidal_playlist_uuid)
+        # Compute CSV path based on M3U template (saves CSV next to M3U file)
+        csv_path = _compute_csv_path_for_playlist(
+            ctx=ctx,
+            tidal_playlist_uuid=tidal_playlist_uuid,
+            download_path=CONFIG.download.download_path,
+        )
+        report_collector.start_playlist(playlist_name, tidal_playlist_uuid, csv_path=csv_path)
 
     # Convert and add tracks to Tidal (immediately, one by one)
     log_lines.append("")

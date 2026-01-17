@@ -147,15 +147,42 @@ Your `[templates]` section in `config.toml` defines templates per media type.
 
 ```toml
 [templates]
-default = "{album.artist}/{album.title}/{item.title}"
-track = "tracks/{item.id}"
-video = "videos/{item.title}"
-album = "artists/{album.artist}/{album.title}/{item.title}"
-playlist = "{playlist.creator_name}/{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
-mix = "mixes/{mix_id}/{item.artist} - {item.title}"
+# Audio files go into the "media" subfolder by default
+default = "media/{album.artist}/{album.title}/{item.title}"
+track = "media/{item.artist}/{item.title}"
+video = "media/videos/{item.title}"
+album = "media/{album.artist}/{album.title}/{item.title}"
+playlist = "media/{playlist.creator_name}/{playlist.title}/{playlist.index}. {item.artist} - {item.title}"
+mix = "media/mixes/{mix_id}/{item.artist} - {item.title}"
+
+[m3u.templates]
+# M3U playlists go into the "m3u" subfolder, organized by type
+album = "m3u/album/{album.artist}/{album.title}"
+playlist = "m3u/playlist/{playlist.creator_name}/{playlist.title}"
+mix = "m3u/mix/{mix_id}"
 ```
 
 If no specific template is set, the `default` one is used.
+
+### Default Directory Structure
+
+With the default templates, your files will be organized like this:
+
+```
+~/Music/tiddl/
+├── media/                          # Audio files
+│   └── Artist Name/
+│       └── Album Name/
+│           └── Track Name.flac
+└── m3u/                            # M3U playlists & CSV reports
+    ├── album/
+    │   └── Artist Name/
+    │       └── Album Name.m3u
+    └── playlist/
+        └── Creator Name/
+            ├── Playlist Name.m3u
+            └── Playlist Name.csv   # Migration report (if migrated from Spotify)
+```
 
 ---
 
