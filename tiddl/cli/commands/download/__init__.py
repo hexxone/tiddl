@@ -400,6 +400,7 @@ def download_callback(
                             ctx.obj.console.print(
                                 f"[red]Wrong Album Template:[/] {exc} ({template=}, {album.id=}, {album_item.item.id=})"
                             )
+                            rich_output.skip_item()
                             continue
 
                         try:
@@ -704,12 +705,14 @@ def download_callback(
                                 if hasattr(item, 'album') and item.album:
                                     track_info += f", Album ID: {item.album.id}"
                                 ctx.obj.console.print(f"[red]API Error:[/] {e} ({track_info})")
+                                rich_output.skip_item()
                                 if not SKIP_ERRORS:
                                     raise
                             except Exception as e:
                                 item = playlist_item.item
                                 track_info = f"Track: {getattr(item, 'title', 'Unknown')} (ID: {item.id})"
                                 ctx.obj.console.print(f"[red]Error:[/] {e} ({track_info})")
+                                rich_output.skip_item()
                                 if not SKIP_ERRORS:
                                     raise
 

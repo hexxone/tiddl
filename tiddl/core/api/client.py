@@ -20,6 +20,7 @@ T = TypeVar("T", bound=BaseModel)
 API_URL = "https://api.tidal.com/v1"
 MAX_RETRIES = 5
 RETRY_DELAY = 2
+RATE_LIMIT_BASE_DELAY = 5  # Base delay for rate limiting (429 errors)
 
 log = getLogger(__name__)
 
@@ -168,6 +169,39 @@ class TidalClient:
                 params=params,
                 expire_after=expire_after,
                 _attempt=MAX_RETRIES - 1,
+            )
+
+        # Handle rate limiting (429) with exponential backoff
+        if res.status_code == 429:
+            if _attempt >= MAX_RETRIES:
+                log.error(f"Rate limited after {MAX_RETRIES} attempts")
+                raise ApiError(
+                    status=429,
+                    subStatus="0",
+                    userMessage="Rate limited by Tidal API. Please wait before retrying.",
+                )
+
+            # Check for Retry-After header, otherwise use exponential backoff
+            retry_after = res.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = int(retry_after)
+                except ValueError:
+                    delay = RATE_LIMIT_BASE_DELAY * (2 ** (_attempt - 1))
+            else:
+                delay = RATE_LIMIT_BASE_DELAY * (2 ** (_attempt - 1))
+
+            log.warning(
+                f"Rate limited (429), waiting {delay}s before retry {_attempt}/{MAX_RETRIES}"
+            )
+            sleep(delay)
+
+            return self.fetch(
+                model=model,
+                endpoint=endpoint,
+                params=params,
+                expire_after=expire_after,
+                _attempt=_attempt + 1,
             )
 
         log.debug(

@@ -38,22 +38,28 @@ def display_playlists_with_selection(
     table.add_column("Owner", style="yellow")
 
     for idx, playlist in enumerate(playlists, 1):
+        is_liked_songs = playlist.get('_is_liked_songs', False)
         owner_name = get_owner_name(playlist)
         is_owner = user_id and playlist['owner']['id'] == user_id
 
         # Selection checkbox
         checkbox = "[green]✓[/]" if idx in selected else "[dim]○[/]"
 
-        # Mark owned playlists
-        if is_owner:
+        # Special display for Liked Songs
+        if is_liked_songs:
+            name = "[bold magenta]♥ Liked Songs[/]"
             owner_display = f"[bold green]★ {owner_name}[/]"
         else:
-            owner_display = owner_name
+            # Mark owned playlists
+            if is_owner:
+                owner_display = f"[bold green]★ {owner_name}[/]"
+            else:
+                owner_display = owner_name
 
-        # Highlight selected rows
-        name = playlist['name']
-        if idx in selected:
-            name = f"[bold]{name}[/]"
+            # Highlight selected rows
+            name = playlist['name']
+            if idx in selected:
+                name = f"[bold]{name}[/]"
 
         table.add_row(
             checkbox,
@@ -79,6 +85,7 @@ def display_help(console: Console, owners: dict[str, list[int]]):
     console.print("  [cyan]all[/]       Select all playlists")
     console.print("  [cyan]none[/]      Deselect all playlists")
     console.print("  [cyan]mine[/]      Select only your own playlists")
+    console.print("  [cyan]liked[/]     Select only Liked Songs")
     console.print("  [cyan]invert[/]    Invert current selection")
     console.print("  [cyan]done[/]      Confirm selection and continue")
     console.print("  [cyan]help[/]      Show this help")
@@ -123,6 +130,13 @@ def parse_selection_input(
         mine = {i for i, p in enumerate(playlists, 1)
                 if user_id and p['owner']['id'] == user_id}
         return mine, f"Selected {len(mine)} owned playlists"
+
+    if cmd == 'liked':
+        liked = {i for i, p in enumerate(playlists, 1)
+                 if p.get('_is_liked_songs', False)}
+        if liked:
+            return liked, "Selected Liked Songs"
+        return current_selection, "No Liked Songs available"
 
     if cmd == 'invert':
         all_indices = set(range(1, len(playlists) + 1))

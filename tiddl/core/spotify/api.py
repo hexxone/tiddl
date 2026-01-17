@@ -73,3 +73,43 @@ class SpotifyAPI:
     def get_current_user(self) -> dict[str, Any]:
         """Get current user's profile"""
         return self.client.make_request("me")
+
+    def get_saved_tracks(self) -> list[dict[str, Any]]:
+        """
+        Get all saved/liked tracks for the current user.
+
+        Returns a list of track dicts (same format as playlist tracks).
+        """
+        tracks = []
+        offset = 0
+        limit = 50  # Spotify max for saved tracks endpoint
+
+        while True:
+            results = self.client.make_request(
+                "me/tracks",
+                params={"limit": limit, "offset": offset}
+            )
+
+            for item in results.get('items', []):
+                if item.get('track') is not None:  # Skip unavailable tracks
+                    tracks.append(item['track'])
+
+            log.debug(f"Fetched {len(results.get('items', []))} saved tracks (offset={offset}, total so far={len(tracks)})")
+
+            # Check if there are more tracks to fetch
+            if not results.get('next'):
+                break
+
+            total = results.get('total', 0)
+            if len(tracks) >= total:
+                break
+
+            offset += limit
+
+        log.info(f"Fetched total of {len(tracks)} saved/liked tracks from Spotify")
+        return tracks
+
+    def get_saved_tracks_count(self) -> int:
+        """Get the count of saved/liked tracks without fetching all of them."""
+        results = self.client.make_request("me/tracks", params={"limit": 1, "offset": 0})
+        return results.get('total', 0)

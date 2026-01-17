@@ -72,6 +72,12 @@ class RichOutput:
 
         self.total_progress.update(self.total_task, total=task.total + count)
 
+    def skip_item(self):
+        """Mark an item as skipped/failed - increments both total and completed."""
+        self.console.print("[yellow]DEBUG: skip_item called[/yellow]")
+        self.total_increment()
+        self.total_progress.advance(self.total_task, advance=1)
+
     def download_start(self, description: str) -> TaskID:
         return self.download_progress.add_task(description=description, total=None)
 

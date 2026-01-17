@@ -13,11 +13,17 @@ log = getLogger(__name__)
 def find_or_reuse_tidal_playlist(
     ctx: Context,
     playlist_name: str,
+    quiet: bool = False,
 ) -> tuple[str, set[str], list[dict]]:
     """
     Find existing Tidal playlist by name or create a new one.
     Returns tuple of (playlist_uuid, set of existing track IDs, list of existing track metadata).
     Track metadata contains: id, title, artists (list of names), duration (seconds).
+
+    Args:
+        ctx: Context object
+        playlist_name: Name of the playlist
+        quiet: If True, suppress console output (for use with fancy UI)
     """
 
     api = ctx.obj.api
@@ -42,7 +48,8 @@ def find_or_reuse_tidal_playlist(
                 if playlist_title == playlist_name:
                     existing_playlist_uuid = playlist_data.get('uuid')
                     num_tracks = playlist_data.get('numberOfTracks', 0)
-                    console.print(f"    Found existing playlist with {num_tracks} track(s)")
+                    if not quiet:
+                        console.print(f"    Found existing playlist with {num_tracks} track(s)")
 
                     # Fetch ALL existing tracks with pagination
                     if num_tracks > 0:
@@ -71,11 +78,13 @@ def find_or_reuse_tidal_playlist(
         # Fall through to create new playlist
 
     if existing_playlist_uuid:
-        console.print(f"    Reusing existing playlist")
+        if not quiet:
+            console.print(f"    Reusing existing playlist")
         return existing_playlist_uuid, existing_track_ids, existing_tracks_metadata
 
     # Create new playlist
-    console.print(f"    Creating new playlist...")
+    if not quiet:
+        console.print(f"    Creating new playlist...")
 
     try:
         result = api.create_playlist(
@@ -100,7 +109,8 @@ def find_or_reuse_tidal_playlist(
             else:
                 raise Exception("Could not determine created playlist UUID")
 
-        console.print(f"    Created new playlist")
+        if not quiet:
+            console.print(f"    Created new playlist")
         return playlist_uuid, set(), []  # Empty set and list for new playlist
 
     except Exception as e:
@@ -302,29 +312,40 @@ def remove_duplicates_from_playlist(
     ctx: Context,
     playlist_uuid: str,
     dry_run: bool = False,
+    quiet: bool = False,
 ) -> tuple[int, int]:
     """
     Remove duplicate tracks from a Tidal playlist.
     Returns tuple of (total_tracks, duplicates_removed).
+
+    Args:
+        ctx: Context object
+        playlist_uuid: UUID of the playlist
+        dry_run: If True, don't actually remove duplicates
+        quiet: If True, suppress console output (for use with fancy UI)
     """
     api = ctx.obj.api
 
     # Fetch all tracks with their indices
-    console.print("    Fetching playlist tracks...")
+    if not quiet:
+        console.print("    Fetching playlist tracks...")
     tracks_with_indices = fetch_playlist_tracks_with_indices(api, playlist_uuid)
 
     if not tracks_with_indices:
-        console.print("    [yellow]No tracks found in playlist[/]")
+        if not quiet:
+            console.print("    [yellow]No tracks found in playlist[/]")
         return 0, 0
 
     # Find duplicates
     duplicates = find_duplicate_indices(tracks_with_indices)
 
     if not duplicates:
-        console.print(f"    [green]No duplicates found in {len(tracks_with_indices)} track(s)[/]")
+        if not quiet:
+            console.print(f"    [green]No duplicates found in {len(tracks_with_indices)} track(s)[/]")
         return len(tracks_with_indices), 0
 
-    console.print(f"    Found {len(duplicates)} duplicate(s) in {len(tracks_with_indices)} track(s)")
+    if not quiet:
+        console.print(f"    Found {len(duplicates)} duplicate(s) in {len(tracks_with_indices)} track(s)")
 
     # Log detailed info about each duplicate
     for dup in duplicates:
@@ -335,7 +356,8 @@ def remove_duplicates_from_playlist(
         )
 
     if dry_run:
-        console.print(f"    [yellow]Would remove {len(duplicates)} duplicate(s)[/]")
+        if not quiet:
+            console.print(f"    [yellow]Would remove {len(duplicates)} duplicate(s)[/]")
         return len(tracks_with_indices), len(duplicates)
 
     # Remove duplicates in batches, starting from the highest index
@@ -364,9 +386,11 @@ def remove_duplicates_from_playlist(
             log.debug(f"Removed batch of {len(batch)} duplicates")
         except Exception as e:
             log.error(f"Error removing duplicates batch: {e}")
-            console.print(f"    [yellow]Warning: Failed to remove some duplicates: {e}[/]")
+            if not quiet:
+                console.print(f"    [yellow]Warning: Failed to remove some duplicates: {e}[/]")
 
-    console.print(f"    [green]Removed {total_removed} duplicate(s)[/]")
+    if not quiet:
+        console.print(f"    [green]Removed {total_removed} duplicate(s)[/]")
     return len(tracks_with_indices), total_removed
 
 

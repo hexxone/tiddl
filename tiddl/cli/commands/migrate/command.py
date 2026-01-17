@@ -91,22 +91,42 @@ def _run_migration_loop(
     cleanup: bool,
     download: bool,
     parallel_download: bool,
+    parallel_migration: bool,
+    migration_workers: int,
     ui: Optional[MigrationUI],
 ):
     """
     Run the main migration loop over selected playlists.
 
     This is extracted to work with both fancy UI and simple console modes.
+    Supports both sequential and parallel migration.
     """
-    total_playlists = len(selected_playlists)
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for i, playlist in enumerate(selected_playlists, 1):
+    total_playlists = len(selected_playlists)
+    total_tracks_all = sum(p.get('tracks', {}).get('total', 0) for p in selected_playlists)
+    _playlist_counter = [0]  # Use list for thread-safe incrementing
+    _counter_lock = threading.Lock()
+
+    # Set up migration config for UI
+    if ui:
+        effective_workers = migration_workers if parallel_migration else 1
+        ui.set_migration_config(total_playlists, effective_workers, total_tracks_all)
+
+    def process_single_playlist(playlist_idx_tuple):
+        """Process a single playlist. Used for both sequential and parallel modes."""
+        i, playlist = playlist_idx_tuple
         playlist_name = playlist['name']
         track_count = playlist.get('tracks', {}).get('total', 0)
 
+        with _counter_lock:
+            _playlist_counter[0] += 1
+            current_num = _playlist_counter[0]
+
         # Update UI with current playlist
         if ui:
-            ui.start_playlist(i, total_playlists, playlist_name, track_count)
+            ui.start_playlist(current_num, total_playlists, playlist_name, track_count)
         else:
             console.print(f"[bold cyan]Processing playlist: {playlist_name}[/]")
 
@@ -122,7 +142,8 @@ def _run_migration_loop(
         )
 
         if result:
-            playlist_names[result] = playlist_name
+            with _counter_lock:
+                playlist_names[result] = playlist_name
 
             # Cleanup duplicates if enabled (before downloading)
             if cleanup and not dry_run:
@@ -133,6 +154,7 @@ def _run_migration_loop(
                         ctx=ctx,
                         playlist_uuid=result,
                         dry_run=False,
+                        quiet=ui is not None,  # Suppress output when using fancy UI
                     )
                     if removed > 0 and not ui:
                         console.print(f"  [green]Cleaned up {removed} duplicate(s)[/]\n")
@@ -141,11 +163,12 @@ def _run_migration_loop(
                     if not ui:
                         console.print(f"  [yellow]Warning: Cleanup failed: {e}[/]\n")
 
-            migrated_playlist_ids.append(result)
+            with _counter_lock:
+                migrated_playlist_ids.append(result)
 
             # Queue/start playlist download with name and track count for timeout calculation
             if ui:
-                ui.queue_download(playlist_name)
+                ui.queue_download(playlist_name, track_count)
             playlist_downloader.add_playlist(result, playlist_name, track_count)
 
             # Show download status in simple mode
@@ -155,17 +178,59 @@ def _run_migration_loop(
                 if total_queued > 0:
                     status_parts = []
                     if completed > 0:
-                        status_parts.append(f"[green]{completed} ✓[/]")
+                        status_parts.append(f"[green]{completed} +[/]")
                     if failed > 0:
-                        status_parts.append(f"[red]{failed} ✗[/]")
+                        status_parts.append(f"[red]{failed} x[/]")
                     if pending > 0:
                         status_parts.append(f"[dim]{pending} pending[/]")
                     console.print(f"  [dim]Downloads: {' '.join(status_parts)}[/]")
 
+        # Always mark playlist as finished in UI (even if migration failed)
+        if ui:
+            ui.finish_playlist(i)
+
+        return result
+
+    def process_with_cleanup(playlist_idx_tuple):
+        """Wrapper to ensure finish_playlist is called even on exceptions."""
+        try:
+            return process_single_playlist(playlist_idx_tuple)
+        except Exception as e:
+            # Still mark as finished on exception
+            if ui:
+                ui.finish_playlist(playlist_idx_tuple[0])
+            raise
+
+    # Run migrations either sequentially or in parallel
+    if parallel_migration and migration_workers > 1:
+        # Parallel migration mode
+        log.info(f"Running parallel migration with {migration_workers} workers")
+        with ThreadPoolExecutor(max_workers=migration_workers) as executor:
+            # Submit all playlists to the executor
+            futures = {
+                executor.submit(process_with_cleanup, (i, playlist)): playlist
+                for i, playlist in enumerate(selected_playlists, 1)
+            }
+
+            # Wait for all to complete
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    playlist = futures[future]
+                    log.error(f"Error migrating playlist {playlist.get('name', 'unknown')}: {e}")
+    else:
+        # Sequential migration mode (original behavior)
+        for i, playlist in enumerate(selected_playlists, 1):
+            process_with_cleanup((i, playlist))
+
     # If using fancy UI with parallel downloads, wait for them to complete within the UI context
     if ui and download and parallel_download:
-        # Keep UI running while downloads complete
-        playlist_downloader.wait_for_completion()
+        # Keep UI running while downloads complete, with periodic refresh for responsiveness
+        playlist_downloader.wait_for_completion(
+            on_progress=ui.refresh,
+            poll_interval=0.5,
+        )
 
 
 @migrate_command.command(help="Migrate and download all Spotify playlists to Tidal.")
@@ -199,6 +264,21 @@ def spotify_to_tidal(
             help="Remove duplicate tracks from playlists after migration.",
         ),
     ] = True,
+    PARALLEL_MIGRATION: Annotated[
+        bool,
+        typer.Option(
+            "--parallel-migration/--sequential-migration",
+            help="Migrate multiple playlists in parallel (default) or sequentially.",
+        ),
+    ] = True,
+    MIGRATION_WORKERS: Annotated[
+        int,
+        typer.Option(
+            "--migration-workers",
+            "-w",
+            help="Number of parallel migration workers (default: 4).",
+        ),
+    ] = 4,
     FANCY_UI: Annotated[
         bool,
         typer.Option(
@@ -271,7 +351,15 @@ def spotify_to_tidal(
         log.error(f"Failed to fetch playlists: {e}", exc_info=True)
         raise typer.Exit()
 
-    if not playlists:
+    # Fetch Liked Songs count and create a pseudo-playlist for it
+    try:
+        liked_songs_count = spotify_api.get_saved_tracks_count()
+        log.debug(f"User has {liked_songs_count} liked songs")
+    except Exception as e:
+        log.warning(f"Could not fetch liked songs count: {e}")
+        liked_songs_count = 0
+
+    if not playlists and liked_songs_count == 0:
         console.print("[yellow]No playlists found.")
         console.print("[dim]This could mean:")
         console.print("  - You have no playlists in your Spotify account")
@@ -283,22 +371,42 @@ def spotify_to_tidal(
     try:
         current_user = spotify_api.get_current_user()
         user_id = current_user['id']
-        console.print(f"[dim]Logged in as: {current_user.get('display_name', user_id)}[/]")
+        user_display_name = current_user.get('display_name', user_id)
+        console.print(f"[dim]Logged in as: {user_display_name}[/]")
     except Exception as e:
         log.warning(f"Could not fetch current user info: {e}")
         user_id = None
+        user_display_name = "Unknown"
 
-    # Sort playlists: owned ones first, then others
+    # Add Liked Songs as a special pseudo-playlist at the beginning
+    if liked_songs_count > 0:
+        liked_songs_playlist = {
+            'id': '__liked_songs__',  # Special ID to identify this pseudo-playlist
+            'name': 'Liked Songs',
+            'tracks': {'total': liked_songs_count},
+            'owner': {
+                'id': user_id or '__self__',
+                'display_name': user_display_name,
+            },
+            '_is_liked_songs': True,  # Flag to identify this as the Liked Songs pseudo-playlist
+        }
+        playlists.insert(0, liked_songs_playlist)
+
+    # Sort playlists: owned ones first, then others (but keep Liked Songs at position 0)
     def sort_key(playlist):
+        # Liked Songs always first
+        if playlist.get('_is_liked_songs'):
+            return (-1, '')
         is_owner = user_id and playlist['owner']['id'] == user_id
         return (0 if is_owner else 1, playlist['name'].lower())
 
     playlists.sort(key=sort_key)
 
-    # Count owned playlists
+    # Count owned playlists (including Liked Songs)
     owned_count = sum(1 for p in playlists if user_id and p['owner']['id'] == user_id)
 
-    console.print(f"[green]Found {len(playlists)} playlist(s)[/] ([cyan]{owned_count} owned by you[/])\n")
+    liked_msg = f" + Liked Songs ({liked_songs_count} tracks)" if liked_songs_count > 0 else ""
+    console.print(f"[green]Found {len(playlists) - (1 if liked_songs_count > 0 else 0)} playlist(s){liked_msg}[/] ([cyan]{owned_count} owned by you[/])\n")
 
     # Playlist selection
     selected_playlists = []
@@ -459,9 +567,12 @@ def spotify_to_tidal(
         parallel=PARALLEL_DOWNLOAD,
         max_workers=2,  # Download up to 2 playlists concurrently
         on_complete=ui.get_download_callback() if ui else None,
+        on_start=ui.get_download_start_callback() if ui else None,
     )
 
     if not FANCY_UI:
+        if PARALLEL_MIGRATION:
+            console.print(f"[dim]Playlists will be migrated in parallel ({MIGRATION_WORKERS} workers)[/]")
         if DOWNLOAD:
             if PARALLEL_DOWNLOAD:
                 console.print("[dim]Playlists will be downloaded in parallel as they complete[/]\n")
@@ -489,6 +600,8 @@ def spotify_to_tidal(
                 cleanup=CLEANUP,
                 download=DOWNLOAD,
                 parallel_download=PARALLEL_DOWNLOAD,
+                parallel_migration=PARALLEL_MIGRATION,
+                migration_workers=MIGRATION_WORKERS,
                 ui=ui,
             )
     else:
@@ -506,6 +619,8 @@ def spotify_to_tidal(
             cleanup=CLEANUP,
             download=DOWNLOAD,
             parallel_download=PARALLEL_DOWNLOAD,
+            parallel_migration=PARALLEL_MIGRATION,
+            migration_workers=MIGRATION_WORKERS,
             ui=None,
         )
 
@@ -602,7 +717,12 @@ def migrate_playlist(
 
     playlist_name = playlist['name']
     playlist_id = playlist['id']
-    spotify_url = f"https://open.spotify.com/playlist/{playlist_id}"
+    is_liked_songs = playlist.get('_is_liked_songs', False)
+
+    if is_liked_songs:
+        spotify_url = "https://open.spotify.com/collection/tracks"
+    else:
+        spotify_url = f"https://open.spotify.com/playlist/{playlist_id}"
 
     # Only print if not using fancy UI (the loop already shows this)
     if not ui:
@@ -619,10 +739,16 @@ def migrate_playlist(
 
     # Fetch tracks from Spotify
     if not ui:
-        console.print("  Fetching tracks from Spotify...")
+        if is_liked_songs:
+            console.print("  Fetching Liked Songs from Spotify...")
+        else:
+            console.print("  Fetching tracks from Spotify...")
 
     try:
-        spotify_tracks = spotify_api.get_playlist_tracks(playlist_id)
+        if is_liked_songs:
+            spotify_tracks = spotify_api.get_saved_tracks()
+        else:
+            spotify_tracks = spotify_api.get_playlist_tracks(playlist_id)
         log_lines.append(f"Fetched {len(spotify_tracks)} tracks from Spotify")
     except Exception as e:
         if not ui:
@@ -650,6 +776,7 @@ def migrate_playlist(
         tidal_playlist_uuid, existing_track_ids, existing_tracks_metadata = find_or_reuse_tidal_playlist(
             ctx=ctx,
             playlist_name=playlist_name,
+            quiet=ui is not None,  # Suppress output when using fancy UI
         )
         tidal_url = f"https://listen.tidal.com/playlist/{tidal_playlist_uuid}"
         log_lines.append(f"Target URL: {tidal_url}")

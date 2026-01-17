@@ -29,6 +29,7 @@ class PlaylistDownloader:
         max_workers: int = 2,
         skip_errors: bool = True,
         on_complete: Optional[Callable[[str, str, bool, str], None]] = None,
+        on_start: Optional[Callable[[str, str, int], None]] = None,
     ):
         """
         Initialize the playlist downloader.
@@ -39,15 +40,18 @@ class PlaylistDownloader:
             max_workers: Maximum concurrent playlist downloads (only used if parallel=True)
             skip_errors: If True, pass --skip-errors to tiddl download to skip unavailable tracks
             on_complete: Callback(playlist_uuid, playlist_name, success, message) called when a download finishes
+            on_start: Callback(playlist_uuid, playlist_name, track_count) called when a download starts
         """
         self.enabled = enabled
         self.parallel = parallel
         self.skip_errors = skip_errors
         self.on_complete = on_complete
+        self.on_start = on_start
         self._executor: Optional[ThreadPoolExecutor] = None
         self._futures: list[Future] = []
         self._queued_playlists: list[tuple[str, str, int]] = []  # (uuid, name, track_count) for sequential mode
         self._playlist_names: dict[str, str] = {}  # uuid -> name mapping
+        self._playlist_track_counts: dict[str, int] = {}  # uuid -> track_count mapping
         self._completed: int = 0
         self._failed: int = 0
         self._failed_playlists: list[tuple[str, str, str]] = []  # (uuid, name, error_message)
@@ -62,6 +66,7 @@ class PlaylistDownloader:
             return
 
         self._playlist_names[playlist_uuid] = playlist_name
+        self._playlist_track_counts[playlist_uuid] = track_count
 
         if self.parallel and self._executor:
             # Start downloading immediately in background
@@ -75,6 +80,10 @@ class PlaylistDownloader:
         """Download a single playlist using tiddl CLI. Returns (uuid, name, success, message)."""
         try:
             log.debug(f"Starting download for playlist {playlist_name} ({playlist_uuid})")
+
+            # Notify start callback
+            if self.on_start:
+                self.on_start(playlist_uuid, playlist_name, track_count)
             # Build command: tiddl download [options] url <playlist>
             # Options like --skip-errors must come BEFORE the 'url' subcommand
             cmd = _get_tiddl_command() + ["download"]
@@ -161,20 +170,51 @@ class PlaylistDownloader:
         self._queued_playlists.clear()
         return results
 
-    def wait_for_completion(self) -> list[tuple[str, str, bool, str]]:
-        """Wait for all parallel downloads to complete. Returns list of (uuid, name, success, message)."""
+    def wait_for_completion(
+        self,
+        on_progress: Optional[Callable[[], None]] = None,
+        poll_interval: float = 0.5,
+    ) -> list[tuple[str, str, bool, str]]:
+        """
+        Wait for all parallel downloads to complete.
+
+        Args:
+            on_progress: Optional callback called periodically during wait (for UI updates)
+            poll_interval: How often to call on_progress (in seconds)
+
+        Returns:
+            List of (uuid, name, success, message) tuples.
+        """
+        from concurrent.futures import as_completed, wait, FIRST_COMPLETED
+        import time
+
         if not self.enabled or not self.parallel:
             return []
 
         results = []
-        for future in self._futures:
-            try:
-                # No timeout here - let the subprocess timeout handle it
-                result = future.result(timeout=None)
-                results.append(result)
-            except Exception as e:
-                log.error(f"Future error: {e}")
-                results.append(("unknown", "Unknown", False, str(e)))
+        remaining_futures = list(self._futures)
+
+        while remaining_futures:
+            # Wait for at least one future to complete, with timeout for periodic callback
+            done, remaining_futures_set = wait(
+                remaining_futures,
+                timeout=poll_interval,
+                return_when=FIRST_COMPLETED,
+            )
+            remaining_futures = list(remaining_futures_set)
+
+            # Process completed futures
+            for future in done:
+                try:
+                    result = future.result(timeout=0)  # Already complete, should not block
+                    results.append(result)
+                except Exception as e:
+                    log.error(f"Future error: {e}")
+                    results.append(("unknown", "Unknown", False, str(e)))
+
+            # Call progress callback for UI updates
+            if on_progress:
+                on_progress()
 
         self._futures.clear()
         return results
